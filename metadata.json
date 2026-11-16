@@ -1,0 +1,6 @@
+{
+  "name": "Prism Sling",
+  "description": "Mobile-first 2D physics sling brick breaker arcade game with sub-stepped collisions, glowing trails, and procedural Web Audio sound.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
