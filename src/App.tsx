@@ -4,14 +4,29 @@ import { CheckCircle2 } from 'lucide-react';
 import { GameControls } from './components/GameControls.tsx';
 import { GameHUD } from './components/GameHUD.tsx';
 import { GameOverModal } from './components/GameOverModal.tsx';
+import { GlobalActivityEntry } from './components/GlobalActivityBar.tsx';
+import { HomeScreen } from './components/HomeScreen.tsx';
 import { MissionsDrawer } from './components/MissionsDrawer.tsx';
 import { OfflineIndicator } from './components/OfflineIndicator.tsx';
 import {
+  GlobalRankSummary,
   LeaderboardDrawer,
   LeaderboardEntry,
   PlayerProfileSummary,
 } from './components/LeaderboardDrawer.tsx';
-import { soundEngine } from './game/audio.ts';
+import {
+  AudioChannel,
+  AudioVolumeSettings,
+  soundEngine,
+} from './game/audio.ts';
+import {
+  claimDailyReward,
+  consumeDailyRewardForRun,
+  DAILY_REWARD_MULTIPLIER_BOOST,
+  DailyRewardState,
+  loadDailyReward,
+  selectDailyRewardChoice,
+} from './game/dailyReward.ts';
 import { hapticsEngine } from './game/haptics.ts';
 import {
   applyRunMissionProgress,
@@ -26,10 +41,26 @@ import {
   loadPlayerProgress,
   PlayerProgressState,
   recordCompletedRun,
+  recordDailyMissionsHistory,
   recordMissionCompletionDay,
   recordPlayDay,
+  SavedActiveRun,
   saveActiveRunSnapshot,
 } from './game/progress.ts';
+import {
+  applyRunMasteryQuestProgress,
+  getMasteryQuestBonus,
+  loadMasteryQuests,
+  loadSelectedDifficulty,
+  MasteryQuestsState,
+  saveSelectedDifficulty,
+} from './game/quests.ts';
+import {
+  getDefaultGuestCallsign,
+  getOrCreateGuestId,
+  loadSavedPlayerName,
+  savePlayerName,
+} from './game/playerIdentity.ts';
 import {
   createInitialGameState,
   fireSalvo,
@@ -41,6 +72,8 @@ import {
 } from './game/physics.ts';
 import { renderGame } from './game/renderer.ts';
 import {
+  DailyRewardChoice,
+  DifficultyMode,
   GamePhase,
   GameState,
   LOGICAL_HEIGHT,
@@ -53,10 +86,15 @@ interface UiSnapshot {
   score: number;
   bestScore: number;
   turn: number;
+  difficultyMode: DifficultyMode;
   difficultyTier: number;
+  stageSpeedMult: number;
   ballCount: number;
   pendingExtraBalls: number;
   shields: number;
+  dailyMultiplier: number;
+  trajectoryCombo: number;
+  trajectoryComboBump: number;
   powerupsCollected: number;
   maxBalls: number;
   fastForward: boolean;
@@ -72,10 +110,15 @@ function toSnapshot(state: GameState): UiSnapshot {
     score: state.score,
     bestScore: state.bestScore,
     turn: state.turn,
+    difficultyMode: state.difficultyMode,
     difficultyTier: state.difficultyTier,
+    stageSpeedMult: state.stageSpeedMult,
     ballCount: state.ballCount,
     pendingExtraBalls: state.pendingExtraBalls,
     shields: state.shields,
+    dailyMultiplier: state.dailyScoreMultiplier,
+    trajectoryCombo: state.trajectoryCombo,
+    trajectoryComboBump: state.trajectoryComboBump,
     powerupsCollected: state.powerupsCollected,
     maxBalls: state.maxBalls,
     fastForward: state.fastForward,
@@ -86,34 +129,58 @@ function toSnapshot(state: GameState): UiSnapshot {
   };
 }
 
+function getCombinedQuestMultiplier(
+  daily: DailyMissionsState,
+  mastery: MasteryQuestsState
+): number {
+  return Math.round((getActiveDailyMultiplier(daily) + getMasteryQuestBonus(mastery)) * 100) / 100;
+}
+
 export default function App() {
+  const [screen, setScreen] = useState<'HOME' | 'PLAYING'>('HOME');
+  const [selectedDifficulty, setSelectedDifficulty] = useState<DifficultyMode>(() =>
+    loadSelectedDifficulty()
+  );
+
   const [dailyMissions, setDailyMissions] = useState<DailyMissionsState>(() =>
     loadDailyMissions()
   );
   const dailyMissionsRef = useRef<DailyMissionsState>(dailyMissions);
+
+  const [masteryQuests, setMasteryQuests] = useState<MasteryQuestsState>(() =>
+    loadMasteryQuests()
+  );
+  const masteryQuestsRef = useRef<MasteryQuestsState>(masteryQuests);
+
+  const [dailyReward, setDailyReward] = useState<DailyRewardState>(() =>
+    loadDailyReward()
+  );
+  const dailyRewardRef = useRef<DailyRewardState>(dailyReward);
 
   const [playerProgress, setPlayerProgress] = useState<PlayerProgressState>(() =>
     loadPlayerProgress()
   );
   const playerProgressRef = useRef<PlayerProgressState>(playerProgress);
 
-  const initialRestoredSnapshotRef = useRef(loadActiveRunSnapshot());
+  const [savedRunSnapshot, setSavedRunSnapshot] = useState<SavedActiveRun | null>(() =>
+    loadActiveRunSnapshot()
+  );
+
   const prevMissionMetricsRef = useRef({
-    blocksDestroyed: initialRestoredSnapshotRef.current?.blocksDestroyed ?? 0,
-    powerupsCollected: initialRestoredSnapshotRef.current?.powerupsCollected ?? 0,
-    bombsDetonated: initialRestoredSnapshotRef.current?.bombsDetonated ?? 0,
+    blocksDestroyed: 0,
+    powerupsCollected: 0,
+    bombsDetonated: 0,
+    shieldSaves: 0,
   });
   const missionToastTimerRef = useRef<number | null>(null);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<GameState>(
-    initialRestoredSnapshotRef.current
-      ? restoreGameStateFromSnapshot(
-          initialRestoredSnapshotRef.current,
-          getActiveDailyMultiplier(dailyMissions)
-        )
-      : createInitialGameState(getActiveDailyMultiplier(dailyMissions))
+    createInitialGameState(
+      getCombinedQuestMultiplier(dailyMissions, masteryQuests),
+      selectedDifficulty
+    )
   );
   const pointerRef = useRef<{
     id: number;
@@ -129,7 +196,13 @@ export default function App() {
     height: LOGICAL_HEIGHT,
   });
   const [muted, setMuted] = useState<boolean>(() => soundEngine.isMuted());
+  const [audioVolumes, setAudioVolumes] = useState<AudioVolumeSettings>(() =>
+    soundEngine.getVolumes()
+  );
   const [showLeaderboard, setShowLeaderboard] = useState<boolean>(false);
+  const [leaderboardTab, setLeaderboardTab] = useState<
+    'progress' | 'rankings' | 'audio'
+  >('progress');
   const [showMissions, setShowMissions] = useState<boolean>(false);
   const [missionToast, setMissionToast] = useState<{
     title: string;
@@ -137,13 +210,30 @@ export default function App() {
     activeMultiplier: number;
   } | null>(null);
 
-  // Firebase Auth & Cloud SQL Leaderboard state
+  // Player identity, Firebase Auth & Cloud SQL Leaderboard state
+  const guestIdRef = useRef<string>(getOrCreateGuestId());
+  const [customPlayerName, setCustomPlayerName] = useState<string | null>(() =>
+    loadSavedPlayerName()
+  );
+  const [savingPlayerName, setSavingPlayerName] = useState<boolean>(false);
   const [user, setUser] = useState<User | null>(null);
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [topScore, setTopScore] = useState<LeaderboardEntry | null>(null);
+  const [totalPlayers, setTotalPlayers] = useState<number>(0);
+  const [myRank, setMyRank] = useState<GlobalRankSummary | null>(null);
   const [leaderboardLoading, setLeaderboardLoading] = useState<boolean>(false);
   const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
+  const [globalActivity, setGlobalActivity] = useState<GlobalActivityEntry[]>([]);
+  const [globalActivityLoading, setGlobalActivityLoading] = useState<boolean>(false);
+  const [globalActivityError, setGlobalActivityError] = useState<string | null>(null);
   const [profile, setProfile] = useState<PlayerProfileSummary | null>(null);
   const [cloudSavedThisRun, setCloudSavedThisRun] = useState<boolean>(false);
+
+  const effectivePlayerName =
+    customPlayerName ||
+    user?.displayName ||
+    user?.email?.split('@')[0] ||
+    getDefaultGuestCallsign(guestIdRef.current);
 
   const syncUi = useCallback(() => {
     const st = stateRef.current;
@@ -151,12 +241,14 @@ export default function App() {
     const deltaBlocks = Math.max(0, st.blocksDestroyed - prev.blocksDestroyed);
     const deltaPowerups = Math.max(0, st.powerupsCollected - prev.powerupsCollected);
     const deltaBombs = Math.max(0, st.bombsDetonated - prev.bombsDetonated);
+    const deltaShieldSaves = Math.max(0, st.shieldSavesThisRun - prev.shieldSaves);
 
     prev.blocksDestroyed = st.blocksDestroyed;
     prev.powerupsCollected = st.powerupsCollected;
     prev.bombsDetonated = st.bombsDetonated;
+    prev.shieldSaves = st.shieldSavesThisRun;
 
-    const { nextDaily, newlyCompleted, changed } = applyRunMissionProgress(
+    const dailyResult = applyRunMissionProgress(
       dailyMissionsRef.current,
       {
         blocksDestroyed: deltaBlocks,
@@ -170,35 +262,85 @@ export default function App() {
       }
     );
 
-    if (changed) {
-      dailyMissionsRef.current = nextDaily;
-      const nextMult = getActiveDailyMultiplier(nextDaily);
-      st.dailyScoreMultiplier = nextMult;
-      setDailyMissions(nextDaily);
+    const masteryResult = applyRunMasteryQuestProgress(
+      masteryQuestsRef.current,
+      {
+        blocksDestroyed: deltaBlocks,
+        bombsDetonated: deltaBombs,
+        shieldSaves: deltaShieldSaves,
+      },
+      {
+        turn: st.hasTakenFirstShot ? st.turn : 0,
+        peakChain: st.peakChainThisRun,
+        difficultyMode: st.difficultyMode,
+      }
+    );
 
-      if (newlyCompleted.length > 0) {
-        const latest = newlyCompleted[newlyCompleted.length - 1];
+    if (dailyResult.changed) {
+      dailyMissionsRef.current = dailyResult.nextDaily;
+      setDailyMissions(dailyResult.nextDaily);
+      const historyUpdate = recordDailyMissionsHistory(
+        playerProgressRef.current,
+        dailyResult.nextDaily
+      );
+      if (historyUpdate.changed) {
+        playerProgressRef.current = historyUpdate.next;
+        setPlayerProgress(historyUpdate.next);
+      }
+    }
+    if (masteryResult.changed) {
+      masteryQuestsRef.current = masteryResult.nextQuests;
+      setMasteryQuests(masteryResult.nextQuests);
+    }
+
+    const baseMult = getCombinedQuestMultiplier(
+      dailyMissionsRef.current,
+      masteryQuestsRef.current
+    );
+    const rewardMultBonus =
+      st.dailyRewardBonus === 'multiplier_boost'
+        ? DAILY_REWARD_MULTIPLIER_BOOST
+        : 0;
+    const nextMult = Math.round((baseMult + rewardMultBonus) * 100) / 100;
+    st.dailyScoreMultiplier = nextMult;
+
+    const latestDaily =
+      dailyResult.newlyCompleted[dailyResult.newlyCompleted.length - 1];
+    const latestMastery =
+      masteryResult.newlyCompleted[masteryResult.newlyCompleted.length - 1];
+    const newlyCompletedItem = latestDaily ?? latestMastery;
+
+    if (newlyCompletedItem) {
+      if (latestDaily) {
         const streakUpdate = recordMissionCompletionDay(playerProgressRef.current);
         if (streakUpdate.changed) {
           playerProgressRef.current = streakUpdate.next;
           setPlayerProgress(streakUpdate.next);
         }
-
-        soundEngine.playMissionComplete();
-        hapticsEngine.pickup('multi_ball');
-        setMissionToast({
-          title: latest.title,
-          bonusMultiplier: latest.bonusMultiplier,
-          activeMultiplier: nextMult,
-        });
-        if (missionToastTimerRef.current !== null) {
-          window.clearTimeout(missionToastTimerRef.current);
+        const historyAfterCompletion = recordDailyMissionsHistory(
+          playerProgressRef.current,
+          dailyMissionsRef.current
+        );
+        if (historyAfterCompletion.changed) {
+          playerProgressRef.current = historyAfterCompletion.next;
+          setPlayerProgress(historyAfterCompletion.next);
         }
-        missionToastTimerRef.current = window.setTimeout(() => {
-          setMissionToast(null);
-          missionToastTimerRef.current = null;
-        }, 3600);
       }
+
+      soundEngine.playMissionComplete();
+      hapticsEngine.pickup('multi_ball');
+      setMissionToast({
+        title: newlyCompletedItem.title,
+        bonusMultiplier: newlyCompletedItem.bonusMultiplier,
+        activeMultiplier: nextMult,
+      });
+      if (missionToastTimerRef.current !== null) {
+        window.clearTimeout(missionToastTimerRef.current);
+      }
+      missionToastTimerRef.current = window.setTimeout(() => {
+        setMissionToast(null);
+        missionToastTimerRef.current = null;
+      }, 3600);
     }
 
     if (st.hasTakenFirstShot) {
@@ -215,21 +357,64 @@ export default function App() {
     setSnap(toSnapshot(st));
   }, []);
 
-  const fetchLeaderboard = useCallback(async () => {
+  const fetchLeaderboard = useCallback(async (firebaseUser?: User | null) => {
     setLeaderboardLoading(true);
     setLeaderboardError(null);
     try {
-      const res = await fetch('/api/leaderboard');
+      const headers: Record<string, string> = {};
+      const activeUser = firebaseUser !== undefined ? firebaseUser : auth.currentUser;
+      if (activeUser) {
+        try {
+          const token = await activeUser.getIdToken();
+          headers.Authorization = `Bearer ${token}`;
+        } catch {
+          // Proceed with guestId fallback if token fails
+        }
+      }
+      const query = new URLSearchParams({ guestId: guestIdRef.current });
+      const res = await fetch(`/api/leaderboard?${query.toString()}`, { headers });
       const data = await res.json();
       if (!res.ok) {
         setLeaderboardError(data?.error || 'Failed to load leaderboard.');
         return;
       }
       setLeaderboard(data.entries ?? []);
+      setTopScore(data.topScore ?? null);
+      setTotalPlayers(typeof data.totalPlayers === 'number' ? data.totalPlayers : (data.entries?.length ?? 0));
+      setMyRank(data.myRank ?? null);
     } catch {
       setLeaderboardError('Unable to reach leaderboard service.');
     } finally {
       setLeaderboardLoading(false);
+    }
+  }, []);
+
+  const fetchGlobalActivity = useCallback(async (firebaseUser?: User | null) => {
+    setGlobalActivityLoading(true);
+    setGlobalActivityError(null);
+    try {
+      const headers: Record<string, string> = {};
+      const activeUser = firebaseUser !== undefined ? firebaseUser : auth.currentUser;
+      if (activeUser) {
+        try {
+          const token = await activeUser.getIdToken();
+          headers.Authorization = `Bearer ${token}`;
+        } catch {
+          // Proceed with guestId fallback if token fails
+        }
+      }
+      const query = new URLSearchParams({ guestId: guestIdRef.current });
+      const res = await fetch(`/api/global-activity?${query.toString()}`, { headers });
+      const data = await res.json();
+      if (!res.ok) {
+        setGlobalActivityError(data?.error || 'Failed to load global activity.');
+        return;
+      }
+      setGlobalActivity(data.entries ?? []);
+    } catch {
+      setGlobalActivityError('Unable to reach global activity feed.');
+    } finally {
+      setGlobalActivityLoading(false);
     }
   }, []);
 
@@ -259,6 +444,7 @@ export default function App() {
 
   // Fit 2D Canvas cleanly to any mobile or desktop screen while preserving 420:660 aspect ratio
   useEffect(() => {
+    if (screen !== 'PLAYING') return;
     const stage = stageRef.current;
     if (!stage) return;
 
@@ -287,10 +473,11 @@ export default function App() {
       observer.disconnect();
       window.removeEventListener('resize', updateFittedDimensions);
     };
-  }, []);
+  }, [screen]);
 
   // 60fps requestAnimationFrame Physics & Render Loop
   useEffect(() => {
+    if (screen !== 'PLAYING') return;
     let frameId = 0;
     let lastTime = performance.now();
 
@@ -318,13 +505,16 @@ export default function App() {
 
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [syncUi]);
+  }, [screen, syncUi]);
 
   // Auth listener & initial leaderboard fetch
   useEffect(() => {
-    fetchLeaderboard();
+    fetchLeaderboard(null);
+    fetchGlobalActivity(null);
     const unsub = onAuthStateChanged(auth, (nextUser) => {
       setUser(nextUser);
+      fetchLeaderboard(nextUser);
+      fetchGlobalActivity(nextUser);
       if (nextUser) {
         fetchProfile(nextUser);
       } else {
@@ -332,9 +522,33 @@ export default function App() {
       }
     });
     return () => unsub();
-  }, [fetchLeaderboard, fetchProfile]);
+  }, [fetchLeaderboard, fetchGlobalActivity, fetchProfile]);
 
-  // Auto-save active run progress when tab/app goes to background
+  // Poll real-time global activity while on Home screen
+  useEffect(() => {
+    if (screen !== 'HOME') return;
+    fetchGlobalActivity(user);
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        fetchGlobalActivity(user);
+      }
+    }, 10000);
+    return () => window.clearInterval(intervalId);
+  }, [screen, user, fetchGlobalActivity]);
+
+  // Ambient lo-fi synth music during active gameplay (respects global mute setting)
+  useEffect(() => {
+    if (screen === 'PLAYING' && snap.phase !== 'GAME_OVER') {
+      soundEngine.startAmbientMusic();
+    } else {
+      soundEngine.stopAmbientMusic();
+    }
+    return () => {
+      soundEngine.stopAmbientMusic();
+    };
+  }, [screen, snap.phase]);
+
+  // Auto-save active run progress and pause/resume ambient audio on tab visibility
   useEffect(() => {
     const saveIfReady = () => {
       saveActiveRunSnapshot(stateRef.current);
@@ -342,6 +556,9 @@ export default function App() {
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') {
         saveIfReady();
+        soundEngine.pauseAmbientMusic();
+      } else {
+        soundEngine.resumeAmbientMusicIfActive();
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
@@ -364,6 +581,7 @@ export default function App() {
     if (!recordedLocalGameOverRef.current) {
       recordedLocalGameOverRef.current = true;
       clearActiveRunSnapshot();
+      setSavedRunSnapshot(null);
       const st = stateRef.current;
       const nextProgress = recordCompletedRun(playerProgressRef.current, {
         score: st.score,
@@ -373,24 +591,30 @@ export default function App() {
         blocksDestroyed: st.blocksDestroyed,
         peakChain: st.peakChainThisRun,
         dailyMultiplier: st.dailyScoreMultiplier,
+        difficultyMode: st.difficultyMode,
       });
       playerProgressRef.current = nextProgress;
       setPlayerProgress(nextProgress);
     }
 
-    if (recordedCloudGameOverRef.current || !user || snap.score <= 0) return;
+    if (recordedCloudGameOverRef.current || snap.score <= 0) return;
 
     recordedCloudGameOverRef.current = true;
     (async () => {
       try {
-        const token = await user.getIdToken();
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (user) {
+          const token = await user.getIdToken();
+          headers.Authorization = `Bearer ${token}`;
+        }
         const res = await fetch('/api/runs', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers,
           body: JSON.stringify({
+            guestId: guestIdRef.current,
+            playerName: effectivePlayerName,
             score: snap.score,
             turn: snap.turn,
             maxBalls: snap.maxBalls,
@@ -402,11 +626,14 @@ export default function App() {
         setCloudSavedThisRun(true);
         if (data.profile) setProfile(data.profile);
         if (data.entries) setLeaderboard(data.entries);
+        if ('topScore' in data) setTopScore(data.topScore ?? null);
+        if (typeof data.totalPlayers === 'number') setTotalPlayers(data.totalPlayers);
+        if ('myRank' in data) setMyRank(data.myRank ?? null);
       } catch {
         // Ignore network errors cleanly
       }
     })();
-  }, [snap.phase, snap.score, snap.turn, snap.maxBalls, snap.powerupsCollected, user]);
+  }, [snap.phase, snap.score, snap.turn, snap.maxBalls, snap.powerupsCollected, user, effectivePlayerName]);
 
   // Window blur safety + keyboard Space for Fast Forward
   useEffect(() => {
@@ -511,32 +738,143 @@ export default function App() {
     syncUi();
   };
 
-  const handleRestart = useCallback(() => {
+  const handleSelectDifficulty = useCallback((mode: DifficultyMode) => {
+    setSelectedDifficulty(mode);
+    saveSelectedDifficulty(mode);
+  }, []);
+
+  const handleSelectDailyRewardChoice = useCallback((choice: DailyRewardChoice) => {
+    const next = selectDailyRewardChoice(dailyRewardRef.current, choice);
+    dailyRewardRef.current = next;
+    setDailyReward(next);
+  }, []);
+
+  const handleClaimDailyReward = useCallback(() => {
+    soundEngine.unlock();
+    const next = claimDailyReward(dailyRewardRef.current);
+    dailyRewardRef.current = next;
+    setDailyReward(next);
+    if (next.selectedReward === 'starter_shield') {
+      soundEngine.playShieldGain();
+      hapticsEngine.pickup('shield');
+    } else {
+      soundEngine.playMissionComplete();
+      hapticsEngine.pickup('multi_ball');
+    }
+  }, []);
+
+  const startFreshGame = useCallback(
+    (mode: DifficultyMode) => {
+      soundEngine.unlock();
+      hapticsEngine.cancel();
+      clearActiveRunSnapshot();
+      setSavedRunSnapshot(null);
+
+      const refreshedDaily = loadDailyMissions();
+      dailyMissionsRef.current = refreshedDaily;
+      setDailyMissions(refreshedDaily);
+
+      const refreshedMastery = loadMasteryQuests();
+      masteryQuestsRef.current = refreshedMastery;
+      setMasteryQuests(refreshedMastery);
+
+      const rewardConsumption = consumeDailyRewardForRun(dailyRewardRef.current);
+      dailyRewardRef.current = rewardConsumption.next;
+      setDailyReward(rewardConsumption.next);
+
+      const activeMult = getCombinedQuestMultiplier(
+        refreshedDaily,
+        refreshedMastery
+      );
+      prevMissionMetricsRef.current = {
+        blocksDestroyed: 0,
+        powerupsCollected: 0,
+        bombsDetonated: 0,
+        shieldSaves: 0,
+      };
+
+      const fresh = createInitialGameState(
+        activeMult,
+        mode,
+        rewardConsumption.granted
+      );
+      const bestKnown = Math.max(
+        fresh.bestScore,
+        playerProgressRef.current.bestScore,
+        profile?.bestScore ?? 0
+      );
+      if (bestKnown > fresh.bestScore) {
+        fresh.bestScore = bestKnown;
+      }
+      stateRef.current = fresh;
+      setSnap(toSnapshot(fresh));
+    },
+    [profile?.bestScore]
+  );
+
+  const handleStartNewRun = useCallback(() => {
+    startFreshGame(selectedDifficulty);
+    setScreen('PLAYING');
+  }, [selectedDifficulty, startFreshGame]);
+
+  const handleResumeRun = useCallback(() => {
+    const snapshot = loadActiveRunSnapshot();
+    if (!snapshot) {
+      startFreshGame(selectedDifficulty);
+      setScreen('PLAYING');
+      return;
+    }
+
     soundEngine.unlock();
     hapticsEngine.cancel();
-    clearActiveRunSnapshot();
+
     const refreshedDaily = loadDailyMissions();
     dailyMissionsRef.current = refreshedDaily;
     setDailyMissions(refreshedDaily);
-    const activeMult = getActiveDailyMultiplier(refreshedDaily);
+
+    const refreshedMastery = loadMasteryQuests();
+    masteryQuestsRef.current = refreshedMastery;
+    setMasteryQuests(refreshedMastery);
+
+    const refreshedReward = loadDailyReward();
+    dailyRewardRef.current = refreshedReward;
+    setDailyReward(refreshedReward);
+
+    const activeMult = getCombinedQuestMultiplier(refreshedDaily, refreshedMastery);
     prevMissionMetricsRef.current = {
-      blocksDestroyed: 0,
-      powerupsCollected: 0,
-      bombsDetonated: 0,
+      blocksDestroyed: snapshot.blocksDestroyed,
+      powerupsCollected: snapshot.powerupsCollected,
+      bombsDetonated: snapshot.bombsDetonated,
+      shieldSaves: snapshot.shieldSavesThisRun ?? 0,
     };
 
-    const fresh = createInitialGameState(activeMult);
-    const bestKnown = Math.max(
-      fresh.bestScore,
-      playerProgressRef.current.bestScore,
-      profile?.bestScore ?? 0
-    );
-    if (bestKnown > fresh.bestScore) {
-      fresh.bestScore = bestKnown;
+    const restored = restoreGameStateFromSnapshot(snapshot, activeMult);
+    stateRef.current = restored;
+    setSnap(toSnapshot(restored));
+    setScreen('PLAYING');
+  }, [selectedDifficulty, startFreshGame]);
+
+  const handleGoHome = useCallback(() => {
+    hapticsEngine.cancel();
+    pointerRef.current = null;
+    const st = stateRef.current;
+    st.aim.isDragging = false;
+    st.aim.isValid = false;
+    st.aim.previewPoints = [];
+
+    if (st.phase === 'AIMING' && st.hasTakenFirstShot) {
+      saveActiveRunSnapshot(st);
     }
-    stateRef.current = fresh;
-    syncUi();
-  }, [profile?.bestScore, syncUi]);
+    const refreshedReward = loadDailyReward();
+    dailyRewardRef.current = refreshedReward;
+    setDailyReward(refreshedReward);
+    setSavedRunSnapshot(loadActiveRunSnapshot());
+    setScreen('HOME');
+  }, []);
+
+  const handleRestart = useCallback(() => {
+    startFreshGame(stateRef.current.difficultyMode);
+  }, [startFreshGame]);
 
   const handleToggleFastForward = useCallback(() => {
     stateRef.current.fastForward = !stateRef.current.fastForward;
@@ -555,17 +893,102 @@ export default function App() {
     if (!next) soundEngine.unlock();
   }, [muted]);
 
-  const handleOpenLeaderboard = useCallback(() => {
-    fetchLeaderboard();
-    if (user) fetchProfile(user);
-    setShowLeaderboard(true);
-  }, [fetchLeaderboard, fetchProfile, user]);
+  const handleChangeAudioVolume = useCallback(
+    (channel: AudioChannel, value: number) => {
+      soundEngine.unlock();
+      soundEngine.setChannelVolume(channel, value);
+      setAudioVolumes(soundEngine.getVolumes());
+    },
+    []
+  );
+
+  const handleResetAudioVolumes = useCallback(() => {
+    soundEngine.unlock();
+    const next = soundEngine.resetVolumes();
+    setAudioVolumes(next);
+  }, []);
+
+  const handleTestSfx = useCallback(() => {
+    soundEngine.unlock();
+    soundEngine.previewSfx();
+  }, []);
+
+  const handleSavePlayerName = useCallback(
+    async (rawName: string) => {
+      const clean = savePlayerName(rawName);
+      if (!clean) return;
+      setCustomPlayerName(clean);
+      setSavingPlayerName(true);
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (user) {
+          const token = await user.getIdToken();
+          headers.Authorization = `Bearer ${token}`;
+        }
+        const res = await fetch('/api/player-name', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            guestId: guestIdRef.current,
+            playerName: clean,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.entries) setLeaderboard(data.entries);
+          if ('topScore' in data) setTopScore(data.topScore ?? null);
+          if (typeof data.totalPlayers === 'number') setTotalPlayers(data.totalPlayers);
+          if ('myRank' in data) setMyRank(data.myRank ?? null);
+        }
+      } catch {
+        // Keep local callsign saved even if offline
+      } finally {
+        setSavingPlayerName(false);
+      }
+    },
+    [user]
+  );
+
+  const handleOpenLeaderboard = useCallback(
+    (initialTab: 'progress' | 'rankings' | 'audio' = 'progress') => {
+      const refreshedDaily = loadDailyMissions();
+      dailyMissionsRef.current = refreshedDaily;
+      setDailyMissions(refreshedDaily);
+      const historyUpdate = recordDailyMissionsHistory(
+        playerProgressRef.current,
+        refreshedDaily
+      );
+      if (historyUpdate.changed) {
+        playerProgressRef.current = historyUpdate.next;
+        setPlayerProgress(historyUpdate.next);
+      }
+      setLeaderboardTab(initialTab);
+      fetchLeaderboard(user);
+      if (user) fetchProfile(user);
+      setShowLeaderboard(true);
+    },
+    [fetchLeaderboard, fetchProfile, user]
+  );
 
   const handleOpenMissions = useCallback(() => {
     const refreshedDaily = loadDailyMissions();
     dailyMissionsRef.current = refreshedDaily;
     setDailyMissions(refreshedDaily);
-    stateRef.current.dailyScoreMultiplier = getActiveDailyMultiplier(refreshedDaily);
+    const refreshedMastery = loadMasteryQuests();
+    masteryQuestsRef.current = refreshedMastery;
+    setMasteryQuests(refreshedMastery);
+    const baseMult = getCombinedQuestMultiplier(
+      refreshedDaily,
+      refreshedMastery
+    );
+    const rewardBonusMult =
+      stateRef.current.dailyRewardBonus === 'multiplier_boost'
+        ? DAILY_REWARD_MULTIPLIER_BOOST
+        : 0;
+    stateRef.current.dailyScoreMultiplier =
+      Math.round((baseMult + rewardBonusMult) * 100) / 100;
     setShowMissions(true);
   }, []);
 
@@ -585,9 +1008,15 @@ export default function App() {
     }
   }, []);
 
-  const dailyMultiplier = getActiveDailyMultiplier(dailyMissions);
-  const missionsCompleted = dailyMissions.missions.filter((m) => m.completed).length;
-  const missionsTotal = dailyMissions.missions.length;
+  const totalQuestMultiplier = getCombinedQuestMultiplier(
+    dailyMissions,
+    masteryQuests
+  );
+  const missionsCompleted =
+    dailyMissions.missions.filter((m) => m.completed).length +
+    masteryQuests.quests.filter((q) => q.completed).length;
+  const missionsTotal =
+    dailyMissions.missions.length + masteryQuests.quests.length;
   const effectivePlayStreak = Math.max(
     getEffectivePlayStreak(playerProgress, dailyMissions.dateKey),
     profile?.cloudStreak ?? 0
@@ -602,95 +1031,144 @@ export default function App() {
     <main className="w-screen h-dvh overflow-hidden bg-[#070b14] flex flex-col items-center justify-center select-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
       {/* Mobile-first full-screen portrait shell, centered cleanly on desktop */}
       <div className="relative w-full h-full max-w-[460px] flex flex-col bg-[#0f172a] sm:max-h-[min(96dvh,860px)] sm:rounded-2xl sm:border sm:border-slate-800 sm:shadow-2xl overflow-hidden">
-        <GameHUD
-          score={snap.score}
-          bestScore={displayBestScore}
-          turn={snap.turn}
-          difficultyTier={snap.difficultyTier}
-          ballCount={snap.ballCount}
-          pendingExtraBalls={snap.pendingExtraBalls}
-          shields={snap.shields}
-          dailyMultiplier={dailyMultiplier}
-          muted={muted}
-          onToggleMute={handleToggleMute}
-          onRestart={handleRestart}
-          onOpenLeaderboard={handleOpenLeaderboard}
-        />
+        {screen === 'HOME' ? (
+          <>
+            <OfflineIndicator />
+            <HomeScreen
+              selectedDifficulty={selectedDifficulty}
+              onSelectDifficulty={handleSelectDifficulty}
+              dailyMissions={dailyMissions}
+              masteryQuests={masteryQuests}
+              dailyReward={dailyReward}
+              onSelectDailyRewardChoice={handleSelectDailyRewardChoice}
+              onClaimDailyReward={handleClaimDailyReward}
+              bestScore={displayBestScore}
+              topGlobalScore={topScore}
+              globalActivity={globalActivity}
+              globalActivityLoading={globalActivityLoading}
+              globalActivityError={globalActivityError}
+              playStreak={effectivePlayStreak}
+              totalMultiplier={totalQuestMultiplier}
+              savedRun={savedRunSnapshot}
+              muted={muted}
+              onToggleMute={handleToggleMute}
+              onStartNewRun={handleStartNewRun}
+              onResumeRun={handleResumeRun}
+              onOpenLeaderboard={() => handleOpenLeaderboard('progress')}
+              onOpenTopRankings={() => handleOpenLeaderboard('rankings')}
+              onRefreshGlobalActivity={() => fetchGlobalActivity(user)}
+            />
+          </>
+        ) : (
+          <>
+            <GameHUD
+              score={snap.score}
+              bestScore={displayBestScore}
+              turn={snap.turn}
+              difficultyMode={snap.difficultyMode}
+              difficultyTier={snap.difficultyTier}
+              stageSpeedMult={snap.stageSpeedMult}
+              ballCount={snap.ballCount}
+              pendingExtraBalls={snap.pendingExtraBalls}
+              shields={snap.shields}
+              dailyMultiplier={snap.dailyMultiplier}
+              trajectoryCombo={snap.trajectoryCombo}
+              trajectoryComboBump={snap.trajectoryComboBump}
+              muted={muted}
+              onGoHome={handleGoHome}
+              onToggleMute={handleToggleMute}
+              onRestart={handleRestart}
+              onOpenLeaderboard={() => handleOpenLeaderboard('progress')}
+            />
 
-        <OfflineIndicator />
+            <OfflineIndicator />
 
-        {missionToast && (
-          <div
-            role="status"
-            className="pointer-events-none absolute top-16 left-1/2 -translate-x-1/2 z-20 max-w-[90%] px-3.5 py-2 rounded-xl bg-[#0b1120]/95 border border-emerald-500/45 shadow-lg flex items-center gap-2 text-xs whitespace-nowrap"
-          >
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span className="font-semibold text-white truncate">
-              {missionToast.title}
-            </span>
-            <span className="font-mono-num text-emerald-400 font-bold shrink-0">
-              +{missionToast.bonusMultiplier.toFixed(2)}× ({missionToast.activeMultiplier.toFixed(2)}×)
-            </span>
-          </div>
-        )}
+            {missionToast && (
+              <div
+                role="status"
+                className={`pointer-events-none absolute left-1/2 -translate-x-1/2 z-20 max-w-[90%] px-3.5 py-2 rounded-xl bg-[#0b1120]/95 border border-emerald-500/45 shadow-lg flex items-center gap-2 text-xs whitespace-nowrap transition-[top] duration-150 ${
+                  snap.trajectoryCombo >= 2 ? 'top-28' : 'top-16'
+                }`}
+              >
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span className="font-semibold text-white truncate">
+                  {missionToast.title}
+                </span>
+                <span className="font-mono-num text-emerald-400 font-bold shrink-0">
+                  +{missionToast.bonusMultiplier.toFixed(2)}× ({missionToast.activeMultiplier.toFixed(2)}×)
+                </span>
+              </div>
+            )}
 
-        {/* Flexible 2D Canvas Stage: always scales to fit screen height & width */}
-        <div
-          ref={stageRef}
-          className="relative flex-1 min-h-0 w-full flex items-center justify-center bg-[#0f172a] overflow-hidden"
-        >
-          <canvas
-            ref={canvasRef}
-            onPointerDown={handlePointerDown}
-            onPointerMove={handlePointerMove}
-            onPointerUp={(e) => handlePointerEnd(e, false)}
-            onPointerCancel={(e) => handlePointerEnd(e, true)}
-            style={{
-              width: `${canvasSize.width}px`,
-              height: `${canvasSize.height}px`,
-            }}
-            className="block touch-none-canvas cursor-crosshair"
-          />
-        </div>
+            {/* Flexible 2D Canvas Stage: always scales to fit screen height & width */}
+            <div
+              ref={stageRef}
+              className="relative flex-1 min-h-0 w-full flex items-center justify-center bg-[#0f172a] overflow-hidden"
+            >
+              <canvas
+                ref={canvasRef}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={(e) => handlePointerEnd(e, false)}
+                onPointerCancel={(e) => handlePointerEnd(e, true)}
+                style={{
+                  width: `${canvasSize.width}px`,
+                  height: `${canvasSize.height}px`,
+                }}
+                className="block touch-none-canvas cursor-crosshair"
+              />
+            </div>
 
-        <GameControls
-          phase={snap.phase}
-          fastForward={snap.fastForward}
-          isAiming={snap.isAiming}
-          isAimValid={snap.isAimValid}
-          aimAngleDeg={snap.aimAngleDeg}
-          bestScore={displayBestScore}
-          missionsCompleted={missionsCompleted}
-          missionsTotal={missionsTotal}
-          dailyMultiplier={dailyMultiplier}
-          onToggleFastForward={handleToggleFastForward}
-          onRecallBalls={handleRecallBalls}
-          onOpenMissions={handleOpenMissions}
-        />
+            <GameControls
+              phase={snap.phase}
+              fastForward={snap.fastForward}
+              isAiming={snap.isAiming}
+              isAimValid={snap.isAimValid}
+              aimAngleDeg={snap.aimAngleDeg}
+              bestScore={displayBestScore}
+              missionsCompleted={missionsCompleted}
+              missionsTotal={missionsTotal}
+              dailyMultiplier={snap.dailyMultiplier}
+              onToggleFastForward={handleToggleFastForward}
+              onRecallBalls={handleRecallBalls}
+              onOpenMissions={handleOpenMissions}
+            />
 
-        {snap.phase === 'GAME_OVER' && (
-          <GameOverModal
-            score={snap.score}
-            bestScore={displayBestScore}
-            turn={snap.turn}
-            powerupsCollected={snap.powerupsCollected}
-            dailyMultiplier={dailyMultiplier}
-            missionsCompleted={missionsCompleted}
-            missionsTotal={missionsTotal}
-            playStreak={effectivePlayStreak}
-            isNewBest={snap.isNewBest}
-            cloudSaved={cloudSavedThisRun}
-            onPlayAgain={handleRestart}
-            onOpenLeaderboard={handleOpenLeaderboard}
-            onOpenMissions={handleOpenMissions}
-          />
+            {snap.phase === 'GAME_OVER' && (
+              <GameOverModal
+                score={snap.score}
+                bestScore={displayBestScore}
+                topGlobalScore={topScore}
+                turn={snap.turn}
+                difficultyMode={snap.difficultyMode}
+                powerupsCollected={snap.powerupsCollected}
+                dailyMultiplier={snap.dailyMultiplier}
+                missionsCompleted={missionsCompleted}
+                missionsTotal={missionsTotal}
+                playStreak={effectivePlayStreak}
+                isNewBest={snap.isNewBest}
+                cloudSaved={cloudSavedThisRun}
+                onPlayAgain={handleRestart}
+                onGoHome={handleGoHome}
+                onOpenLeaderboard={() => handleOpenLeaderboard('rankings')}
+                onOpenMissions={handleOpenMissions}
+              />
+            )}
+          </>
         )}
       </div>
 
       {showMissions && (
         <MissionsDrawer
           dailyState={dailyMissions}
+          masteryState={masteryQuests}
           playerProgress={playerProgress}
+          audioVolumes={audioVolumes}
+          muted={muted}
+          onChangeAudioVolume={handleChangeAudioVolume}
+          onToggleMute={handleToggleMute}
+          onResetAudioVolumes={handleResetAudioVolumes}
+          onTestSfx={handleTestSfx}
           onClose={() => setShowMissions(false)}
         />
       )}
@@ -698,12 +1176,26 @@ export default function App() {
       {showLeaderboard && (
         <LeaderboardDrawer
           entries={leaderboard}
+          topScore={topScore}
+          totalPlayers={totalPlayers}
+          myRank={myRank}
+          playerName={effectivePlayerName}
+          savingPlayerName={savingPlayerName}
+          initialTab={leaderboardTab}
           profile={profile}
           playerProgress={playerProgress}
+          dailyMissions={dailyMissions}
           loading={leaderboardLoading}
           error={leaderboardError}
           userEmail={user?.email ?? null}
           userName={user?.displayName ?? null}
+          audioVolumes={audioVolumes}
+          muted={muted}
+          onChangeAudioVolume={handleChangeAudioVolume}
+          onToggleMute={handleToggleMute}
+          onResetAudioVolumes={handleResetAudioVolumes}
+          onTestSfx={handleTestSfx}
+          onSavePlayerName={handleSavePlayerName}
           onClose={() => setShowLeaderboard(false)}
           onSignIn={handleSignIn}
           onSignOut={handleSignOut}

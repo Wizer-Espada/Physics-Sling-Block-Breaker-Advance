@@ -1,5 +1,9 @@
-import { soundEngine } from './audio.ts';
+import { ComboVoiceTier, soundEngine } from './audio.ts';
 import { getBlockColors, getChainMultiplierColor } from './colors.ts';
+import {
+  DAILY_REWARD_MULTIPLIER_BOOST,
+  DAILY_REWARD_SHIELD_COUNT,
+} from './dailyReward.ts';
 import { hapticsEngine } from './haptics.ts';
 import {
   BALL_RADIUS,
@@ -8,13 +12,18 @@ import {
   Ball,
   Block,
   BlockShape,
+  BuffType,
   CELL_GAP,
   CELL_SIZE,
   COLS,
   DANGER_ROW,
   DANGER_Y,
+  DIFFICULTY_CONFIGS,
+  DailyRewardChoice,
+  DifficultyMode,
   FIRE_INTERVAL,
   FLOOR_Y,
+  FloatingBuff,
   GameState,
   LOGICAL_WIDTH,
   MAX_ANGLE_RAD,
@@ -33,6 +42,14 @@ const MAX_ACTIVE_BALLS = 90;
 const MAX_PARTICLES = 360;
 const MAX_MULTIPLIER_POPUPS = 28;
 const MAX_CHAIN_MULTIPLIER = 12;
+
+function getComboVoiceTier(combo: number): ComboVoiceTier | 0 {
+  if (combo >= 12) return 4;
+  if (combo >= 9) return 3;
+  if (combo >= 6) return 2;
+  if (combo >= 4) return 1;
+  return 0;
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -73,8 +90,57 @@ function shuffleCols(): number[] {
   return arr;
 }
 
-export function getDifficultyTier(turn: number): number {
-  return 1 + Math.floor(turn / 10);
+export interface StageMetadata {
+  stage: number;
+  title: string;
+  speedMult: number;
+  fireCadenceMult: number;
+  shiftSpeedMult: number;
+}
+
+const STAGE_TITLES = [
+  'Sector Entry',
+  'Twin Flanks',
+  'Choke Gate',
+  'Vanguard Wedge',
+  'Siege Gauntlet',
+  'Overclock Apex',
+];
+
+export function getDifficultyTier(
+  turn: number,
+  difficultyMode: DifficultyMode = 'standard'
+): number {
+  return 1 + Math.floor(turn / 5) + DIFFICULTY_CONFIGS[difficultyMode].startTierOffset;
+}
+
+export function getStageMetadata(stage: number): StageMetadata {
+  const s = Math.max(1, Math.floor(stage));
+  const title = STAGE_TITLES[Math.min(STAGE_TITLES.length - 1, s - 1)];
+  const speedMult =
+    s <= 5
+      ? Number((1 + (s - 1) * 0.09).toFixed(2))
+      : Number(Math.min(1.6, 1.36 + (s - 5) * 0.07).toFixed(2));
+  const fireCadenceMult =
+    s <= 5
+      ? Number((1 + (s - 1) * 0.07).toFixed(2))
+      : Number(Math.min(1.45, 1.28 + (s - 5) * 0.04).toFixed(2));
+  const shiftSpeedMult =
+    s <= 5
+      ? Number((1 + (s - 1) * 0.06).toFixed(2))
+      : Number(Math.min(1.36, 1.24 + (s - 5) * 0.03).toFixed(2));
+
+  return {
+    stage: s,
+    title,
+    speedMult,
+    fireCadenceMult,
+    shiftSpeedMult,
+  };
+}
+
+function getCurrentBallSpeed(state: GameState): number {
+  return BALL_SPEED * Math.max(1, state.stageSpeedMult || 1);
 }
 
 interface TierProfile {
@@ -86,55 +152,86 @@ interface TierProfile {
   minBlocks: number;
   maxBlocks: number;
   specialChance: number;
+  vanguardChance: number;
+  maxVanguards: number;
 }
 
-function getTierProfile(turn: number): TierProfile {
-  const tier = getDifficultyTier(turn);
+function getTierProfile(turn: number, difficultyMode: DifficultyMode): TierProfile {
+  const cfg = DIFFICULTY_CONFIGS[difficultyMode];
+  const tier = getDifficultyTier(turn, difficultyMode);
+  let base: TierProfile;
+
   if (tier === 1) {
-    return {
+    base = {
       tier,
       baseHpMult: 1.0,
-      circleChance: turn >= 2 ? 0.24 : 0,
-      doubleChance: turn >= 4 ? 0.16 : 0,
+      circleChance: turn >= 2 ? 0.22 : 0,
+      doubleChance: turn >= 3 ? 0.14 : 0,
       tripleChance: 0,
       minBlocks: turn <= 2 ? 2 : 3,
-      maxBlocks: turn <= 4 ? 4 : 5,
+      maxBlocks: turn <= 2 ? 3 : 4,
       specialChance: turn === 1 ? 0.55 : 0.6,
+      vanguardChance: 0,
+      maxVanguards: 0,
     };
-  }
-  if (tier === 2) {
-    return {
+  } else if (tier === 2) {
+    base = {
       tier,
-      baseHpMult: 1.25,
-      circleChance: 0.35,
-      doubleChance: 0.3,
-      tripleChance: 0.1,
-      minBlocks: 4,
+      baseHpMult: 1.18,
+      circleChance: 0.32,
+      doubleChance: 0.26,
+      tripleChance: 0.06,
+      minBlocks: 3,
       maxBlocks: 5,
       specialChance: 0.64,
+      vanguardChance: 0,
+      maxVanguards: 0,
     };
-  }
-  if (tier === 3) {
-    return {
+  } else if (tier === 3) {
+    base = {
       tier,
-      baseHpMult: 1.55,
-      circleChance: 0.44,
+      baseHpMult: 1.38,
+      circleChance: 0.4,
+      doubleChance: 0.34,
+      tripleChance: 0.16,
+      minBlocks: 4,
+      maxBlocks: 5,
+      specialChance: 0.68,
+      vanguardChance: 0.35,
+      maxVanguards: 1,
+    };
+  } else if (tier === 4) {
+    base = {
+      tier,
+      baseHpMult: 1.58,
+      circleChance: 0.46,
       doubleChance: 0.38,
-      tripleChance: 0.22,
+      tripleChance: 0.24,
       minBlocks: 4,
       maxBlocks: 6,
-      specialChance: 0.68,
+      specialChance: 0.7,
+      vanguardChance: 0.58,
+      maxVanguards: 1,
+    };
+  } else {
+    base = {
+      tier,
+      baseHpMult: 1.58 + (tier - 4) * 0.28,
+      circleChance: Math.min(0.58, 0.48 + (tier - 4) * 0.04),
+      doubleChance: 0.42,
+      tripleChance: Math.min(0.38, 0.26 + (tier - 4) * 0.04),
+      minBlocks: 5,
+      maxBlocks: 6,
+      specialChance: 0.74,
+      vanguardChance: Math.min(0.85, 0.65 + (tier - 5) * 0.08),
+      maxVanguards: 2,
     };
   }
+
   return {
-    tier,
-    baseHpMult: 1.55 + (tier - 3) * 0.35,
-    circleChance: Math.min(0.55, 0.44 + (tier - 3) * 0.04),
-    doubleChance: 0.42,
-    tripleChance: Math.min(0.36, 0.22 + (tier - 3) * 0.05),
-    minBlocks: 5,
-    maxBlocks: 6,
-    specialChance: 0.72,
+    ...base,
+    baseHpMult: base.baseHpMult * cfg.hpMult,
+    specialChance: clamp(base.specialChance + cfg.specialChanceBonus, 0.45, 0.85),
   };
 }
 
@@ -142,56 +239,131 @@ function pickTieredLayout(
   tier: number,
   turn: number,
   hasSpecial: boolean
-): { pickupCols: number[]; blockCols: number[] } {
+): {
+  pickupCols: number[];
+  blockCols: number[];
+  vanguardPreferredCols: number[];
+} {
   const shuffled = shuffleCols();
   const maxAvailableBlocks = hasSpecial ? COLS - 2 : COLS - 1;
 
-  // Tier 1 uses organic staggered scatter
+  // Stage 1: organic staggered scatter
   if (tier === 1) {
     const pickupCols = hasSpecial ? [shuffled[0], shuffled[1]] : [shuffled[0]];
     return {
       pickupCols,
       blockCols: shuffled.slice(pickupCols.length),
+      vanguardPreferredCols: [],
     };
   }
 
   // Milestone turns (10, 20, 30...) deploy a fortified Siege Wall
   if (turn % 10 === 0) {
-    const gapCol = 1 + Math.floor(Math.random() * (COLS - 2)); // leave an off-center lane for +1 ball
+    const gapCol = 1 + Math.floor(Math.random() * (COLS - 2));
     const specialCol = gapCol <= 3 ? 5 : 1;
     const pickupCols = hasSpecial ? [gapCol, specialCol] : [gapCol];
     const blockCols = Array.from({ length: COLS }, (_, c) => c).filter(
       (c) => !pickupCols.includes(c)
     );
-    return { pickupCols, blockCols: blockCols.slice(0, maxAvailableBlocks) };
+    return {
+      pickupCols,
+      blockCols: blockCols.slice(0, maxAvailableBlocks),
+      vanguardPreferredCols: [gapCol === 3 ? 2 : 3],
+    };
   }
 
-  // Tier 2+: Rotate through structured tactical obstacle formations
-  const patternRoll = Math.random();
-  if (patternRoll < 0.34) {
-    // Fortress Wings: armored outer flanks, pickups tucked down the center
-    const centerCandidates = [2, 3, 4].sort(() => Math.random() - 0.5);
-    const pickupCols = hasSpecial ? centerCandidates.slice(0, 2) : [centerCandidates[0]];
-    const wingCols = [0, 1, 5, 6, 2, 3, 4].filter((c) => !pickupCols.includes(c));
-    return { pickupCols, blockCols: wingCols.slice(0, maxAvailableBlocks) };
+  // Stage 2: Twin Flanks or Staggered Checkerboard
+  if (tier === 2) {
+    if (Math.random() < 0.55) {
+      const centerCandidates = [2, 3, 4].sort(() => Math.random() - 0.5);
+      const pickupCols = hasSpecial ? centerCandidates.slice(0, 2) : [centerCandidates[0]];
+      const wingCols = [0, 1, 5, 6, 2, 3, 4].filter((c) => !pickupCols.includes(c));
+      return {
+        pickupCols,
+        blockCols: wingCols.slice(0, maxAvailableBlocks),
+        vanguardPreferredCols: [],
+      };
+    }
+    const oddCols = [1, 3, 5].sort(() => Math.random() - 0.5);
+    const pickupCols = hasSpecial ? oddCols.slice(0, 2) : [oddCols[0]];
+    const blockCols = [0, 2, 4, 6, 1, 3, 5].filter((c) => !pickupCols.includes(c));
+    return {
+      pickupCols,
+      blockCols: blockCols.slice(0, maxAvailableBlocks),
+      vanguardPreferredCols: [],
+    };
   }
-  if (patternRoll < 0.68) {
-    // Choke Gate: dense middle wall forcing side-wall bank angles
+
+  // Stage 3+: Choke Gate, Split Pillars, Fortress Wings, or Vanguard Wedge
+  const patternRoll = Math.random();
+  if (patternRoll < 0.3) {
+    // Choke Gate: dense center cluster forcing bank shots off the side walls
     const edgeCandidates = [0, 6, 1, 5].sort(() => Math.random() - 0.5);
     const pickupCols = hasSpecial ? edgeCandidates.slice(0, 2) : [edgeCandidates[0]];
     const gateCols = [2, 3, 4, 1, 5, 0, 6].filter((c) => !pickupCols.includes(c));
-    return { pickupCols, blockCols: gateCols.slice(0, maxAvailableBlocks) };
+    return {
+      pickupCols,
+      blockCols: gateCols.slice(0, maxAvailableBlocks),
+      vanguardPreferredCols: [3, 2, 4],
+    };
+  }
+  if (patternRoll < 0.6) {
+    // Split Pillars: twin armored lanes with shielded center pocket
+    const laneCandidates = [1, 5, 3].sort(() => Math.random() - 0.5);
+    const pickupCols = hasSpecial ? laneCandidates.slice(0, 2) : [laneCandidates[0]];
+    const pillarCols = [0, 3, 6, 2, 4, 1, 5].filter((c) => !pickupCols.includes(c));
+    return {
+      pickupCols,
+      blockCols: pillarCols.slice(0, maxAvailableBlocks),
+      vanguardPreferredCols: [2, 4, 3],
+    };
+  }
+  if (patternRoll < 0.85) {
+    // Fortress Wings: outer bastions + center pickups
+    const centerCandidates = [2, 3, 4].sort(() => Math.random() - 0.5);
+    const pickupCols = hasSpecial ? centerCandidates.slice(0, 2) : [centerCandidates[0]];
+    const wingCols = [0, 1, 5, 6, 2, 3, 4].filter((c) => !pickupCols.includes(c));
+    return {
+      pickupCols,
+      blockCols: wingCols.slice(0, maxAvailableBlocks),
+      vanguardPreferredCols: [1, 5, 3],
+    };
   }
 
-  // Checkerboard / Staggered Bastion
+  // Zigzag / Staggered Bastion
   const oddCols = [1, 3, 5].sort(() => Math.random() - 0.5);
   const pickupCols = hasSpecial ? oddCols.slice(0, 2) : [oddCols[0]];
   const blockCols = [0, 2, 4, 6, 1, 3, 5].filter((c) => !pickupCols.includes(c));
-  return { pickupCols, blockCols: blockCols.slice(0, maxAvailableBlocks) };
+  return {
+    pickupCols,
+    blockCols: blockCols.slice(0, maxAvailableBlocks),
+    vanguardPreferredCols: [1, 3, 5],
+  };
 }
 
-export function createInitialGameState(dailyScoreMultiplier = 1): GameState {
+export function createInitialGameState(
+  dailyScoreMultiplier = 1,
+  difficultyMode: DifficultyMode = 'standard',
+  dailyRewardBonus: DailyRewardChoice | null = null
+): GameState {
   const bestScore = loadBestScore();
+  const cfg = DIFFICULTY_CONFIGS[difficultyMode];
+  const initialStage = getDifficultyTier(1, difficultyMode);
+  const stageMeta = getStageMetadata(initialStage);
+  const rewardMultBonus =
+    dailyRewardBonus === 'multiplier_boost' ? DAILY_REWARD_MULTIPLIER_BOOST : 0;
+  const effectiveMultiplier =
+    Math.round((Math.max(1, dailyScoreMultiplier) + rewardMultBonus) * 100) / 100;
+  const startingShields =
+    dailyRewardBonus === 'starter_shield'
+      ? Math.min(MAX_SHIELDS + 1, cfg.startingShields + DAILY_REWARD_SHIELD_COUNT)
+      : cfg.startingShields;
+  const rewardNotice =
+    dailyRewardBonus === 'multiplier_boost'
+      ? `DAILY REWARD · +${DAILY_REWARD_MULTIPLIER_BOOST.toFixed(2)}× BOOST`
+      : dailyRewardBonus === 'starter_shield'
+        ? 'DAILY REWARD · +1 STARTER SHIELD'
+        : null;
   const state: GameState = {
     phase: 'AIMING',
     score: 0,
@@ -213,6 +385,8 @@ export function createInitialGameState(dailyScoreMultiplier = 1): GameState {
     shakeKickX: 0,
     shakeKickY: 0,
     combo: 0,
+    trajectoryCombo: 0,
+    trajectoryComboBump: 0,
     turnPeakMultiplier: 0,
     turnPeakMultiplierTimer: 0,
     multiplierHudAlpha: 0,
@@ -222,20 +396,30 @@ export function createInitialGameState(dailyScoreMultiplier = 1): GameState {
     peakChainThisRun: 0,
     blocksDestroyed: 0,
     bombsDetonated: 0,
-    dailyScoreMultiplier: Math.max(1, dailyScoreMultiplier),
+    dailyScoreMultiplier: effectiveMultiplier,
+    dailyRewardBonus,
     scoreRemainder: 0,
     isNewBest: false,
     hasTakenFirstShot: false,
-    difficultyTier: 1,
-    tierBannerText: null,
-    tierBannerTimer: 0,
-    shields: 1,
-    shieldFlashTimer: 0,
-    shieldNoticeText: null,
-    shieldNoticeTimer: 0,
+    difficultyMode,
+    difficultyTier: initialStage,
+    stageSpeedMult: stageMeta.speedMult,
+    tierBannerText:
+      initialStage > 1
+        ? `STAGE ${initialStage} · ${stageMeta.title.toUpperCase()} (${stageMeta.speedMult.toFixed(2)}× SPD)`
+        : null,
+    tierBannerTimer: initialStage > 1 ? 2.2 : 0,
+    shields: startingShields,
+    shieldSavesThisRun: 0,
+    shieldFlashTimer: dailyRewardBonus === 'starter_shield' ? 0.55 : 0,
+    shieldNoticeText: rewardNotice,
+    shieldNoticeTimer: rewardNotice ? 2.6 : 0,
+    buffMultiBallTurns: 0,
+    buffShieldExpandTurns: 0,
     nextEntityId: 1,
     blocks: [],
     pickups: [],
+    floatingBuffs: [],
     balls: [],
     particles: [],
     shockwaves: [],
@@ -254,10 +438,10 @@ export function createInitialGameState(dailyScoreMultiplier = 1): GameState {
 }
 
 export function spawnRow(state: GameState, animateEntry: boolean): void {
-  const profile = getTierProfile(state.turn);
+  const profile = getTierProfile(state.turn, state.difficultyMode);
   const y = animateEntry ? rowToY(-1) : rowToY(0);
   const spawnSpecial = Math.random() < profile.specialChance;
-  const { pickupCols, blockCols } = pickTieredLayout(
+  const { pickupCols, blockCols, vanguardPreferredCols } = pickTieredLayout(
     profile.tier,
     state.turn,
     spawnSpecial
@@ -317,26 +501,48 @@ export function spawnRow(state: GameState, animateEntry: boolean): void {
     : minCount + Math.floor(Math.random() * Math.max(1, maxCount - minCount + 1));
 
   const baseHp = Math.max(1, Math.round(state.turn * profile.baseHpMult));
+  const hasPowerupBrickOnBoard = state.blocks.some(
+    (b) => b.hp > 0 && b.kind === 'powerup'
+  );
+  const powerupBrickChance =
+    state.difficultyMode === 'relaxed' ? 0.2 : 0.16;
+  const shouldSpawnPowerupBrick =
+    !isMilestone &&
+    !hasPowerupBrickOnBoard &&
+    count >= 2 &&
+    Math.random() < powerupBrickChance;
+  const powerupIndex = shouldSpawnPowerupBrick
+    ? Math.floor(Math.random() * Math.min(count, blockCols.length))
+    : -1;
 
   for (let i = 0; i < count && i < blockCols.length; i++) {
     const col = blockCols[i];
     const roll = Math.random();
+    const isPowerupBrick = i === powerupIndex;
 
     let hpMult = 1;
     if (isMilestone && i === 0) {
       hpMult = Math.min(4, 2 + Math.floor(profile.tier / 2)); // Keystone boss brick on every 10th turn
     } else if (state.turn % 5 === 0 && i === 0) {
       hpMult = 2;
-    } else if (roll < profile.tripleChance) {
+    } else if (!isPowerupBrick && roll < profile.tripleChance) {
       hpMult = 3;
-    } else if (roll < profile.tripleChance + profile.doubleChance) {
+    } else if (!isPowerupBrick && roll < profile.tripleChance + profile.doubleChance) {
       hpMult = 2;
     }
 
-    const hp = Math.max(1, Math.round(baseHp * hpMult));
-    const armored = hpMult >= 2;
-    const shape: BlockShape =
-      Math.random() < profile.circleChance ? 'circle' : 'rect';
+    const hp = Math.max(1, Math.round(baseHp * (isPowerupBrick ? 1.15 : hpMult)));
+    const armored = !isPowerupBrick && hpMult >= 2;
+    const shape: BlockShape = isPowerupBrick
+      ? 'rect'
+      : Math.random() < profile.circleChance
+        ? 'circle'
+        : 'rect';
+    const powerupReward: BuffType | undefined = isPowerupBrick
+      ? Math.random() < (state.shields === 0 ? 0.58 : 0.45)
+        ? 'shield_expansion'
+        : 'multi_ball'
+      : undefined;
 
     const block: Block = {
       id: state.nextEntityId++,
@@ -349,11 +555,52 @@ export function spawnRow(state: GameState, animateEntry: boolean): void {
       hp,
       maxHp: hp,
       shape,
+      kind: isPowerupBrick ? 'powerup' : 'standard',
+      powerupReward,
       armored,
       flashTimer: 0,
       hitScale: 0,
     };
     state.blocks.push(block);
+  }
+
+  // Stage 3+: Spawn 1-2 armored vanguard bumper bricks in unoccupied row-1 cells for multi-row formations
+  if (
+    animateEntry &&
+    profile.maxVanguards > 0 &&
+    Math.random() < profile.vanguardChance
+  ) {
+    let placed = 0;
+    const candidates =
+      vanguardPreferredCols.length > 0 ? vanguardPreferredCols : shuffleCols();
+    for (const col of candidates) {
+      if (placed >= profile.maxVanguards) break;
+      const occupiedByBlock = state.blocks.some(
+        (b) => b.hp > 0 && b.col === col && b.row === 1
+      );
+      const occupiedByPickup = state.pickups.some(
+        (p) => !p.collected && p.col === col && p.row === 1
+      );
+      if (occupiedByBlock || occupiedByPickup) continue;
+
+      const vanguardHp = Math.max(2, Math.round(baseHp * 1.4));
+      state.blocks.push({
+        id: state.nextEntityId++,
+        col,
+        row: 1,
+        x: colToX(col),
+        y: rowToY(0), // Slides smoothly from row 0 to row 1 during SHIFTING
+        width: CELL_SIZE,
+        height: CELL_SIZE,
+        hp: vanguardHp,
+        maxHp: vanguardHp,
+        shape: 'circle',
+        armored: true,
+        flashTimer: 0,
+        hitScale: 0,
+      });
+      placed += 1;
+    }
   }
 }
 
@@ -498,7 +745,12 @@ export function updateAim(state: GameState, rawDx: number, rawDy: number): void 
 export function fireSalvo(state: GameState, angleRad: number): void {
   state.hasTakenFirstShot = true;
   state.launchAngleRad = clamp(angleRad, MIN_ANGLE_RAD, MAX_ANGLE_RAD);
-  state.ballsToFire = state.ballCount;
+  const bonusSurgeBalls = state.buffMultiBallTurns > 0 ? 3 : 0;
+  if (state.buffMultiBallTurns > 0) {
+    state.buffMultiBallTurns -= 1;
+  }
+  state.ballsToFire = state.ballCount + bonusSurgeBalls;
+  state.maxBalls = Math.max(state.maxBalls, state.ballsToFire);
   state.fireCooldown = 0;
   state.nextLaunchX = null;
   state.recallActive = false;
@@ -690,12 +942,48 @@ function spawnRadialBurst(
 }
 
 function addScaledScore(state: GameState, rawPoints: number): number {
-  const mult = Math.max(1, state.dailyScoreMultiplier);
+  const diffMult = DIFFICULTY_CONFIGS[state.difficultyMode].scoreMult;
+  const mult = Math.max(1, state.dailyScoreMultiplier) * diffMult;
   const total = rawPoints * mult + state.scoreRemainder;
   const whole = Math.floor(total);
   state.scoreRemainder = total - whole;
   state.score += whole;
   return whole;
+}
+
+function spawnFloatingBuffFromBlock(state: GameState, block: Block): void {
+  if (block.kind !== 'powerup') return;
+  const cx = block.x + block.width / 2;
+  const cy = block.y + block.height / 2;
+  const buffType: BuffType =
+    block.powerupReward ??
+    (Math.random() < (state.shields === 0 ? 0.58 : 0.45)
+      ? 'shield_expansion'
+      : 'multi_ball');
+
+  const driftTowardCenter = (LOGICAL_WIDTH / 2 - cx) * 0.18;
+  const buff: FloatingBuff = {
+    id: state.nextEntityId++,
+    type: buffType,
+    x: cx,
+    y: cy,
+    vx: clamp(driftTowardCenter, -36, 36),
+    vy: -95,
+    radius: 16,
+    bobPhase: Math.random() * Math.PI * 2,
+    life: 11.0,
+    maxLife: 11.0,
+    collected: false,
+  };
+  state.floatingBuffs.push(buff);
+  spawnRadialBurst(
+    state,
+    cx,
+    cy,
+    buffType === 'multi_ball' ? '#38bdf8' : '#818cf8',
+    16,
+    46
+  );
 }
 
 function hitBlock(
@@ -710,6 +998,16 @@ function hitBlock(
   block.flashTimer = 0.08;
   block.hitScale = 1;
   state.combo += 1;
+  ball.hitChain += 1;
+  if (ball.hitChain >= 2 && ball.hitChain > state.trajectoryCombo) {
+    const prevVoiceTier = getComboVoiceTier(state.trajectoryCombo);
+    state.trajectoryCombo = ball.hitChain;
+    state.trajectoryComboBump += 1;
+    const nextVoiceTier = getComboVoiceTier(state.trajectoryCombo);
+    if (nextVoiceTier !== 0 && nextVoiceTier > prevVoiceTier) {
+      soundEngine.playComboVoice(nextVoiceTier);
+    }
+  }
   addScaledScore(state, 1);
 
   if (block.hp <= 0) {
@@ -729,6 +1027,7 @@ function hitBlock(
 
     const burstIntensity = multiplier >= 2 ? Math.min(1.45, 1 + (multiplier - 1) * 0.08) : 1;
     spawnBlockDestructionBurst(state, block, prevColors.stroke, impactVx, impactVy, burstIntensity);
+    spawnFloatingBuffFromBlock(state, block);
 
     if (multiplier >= 2) {
       const cx = block.x + block.width / 2;
@@ -759,7 +1058,8 @@ function hitBlock(
 function rotateVelocity(
   vx: number,
   vy: number,
-  deltaRad: number
+  deltaRad: number,
+  targetSpeed = BALL_SPEED
 ): { vx: number; vy: number } {
   const cos = Math.cos(deltaRad);
   const sin = Math.sin(deltaRad);
@@ -770,8 +1070,8 @@ function rotateVelocity(
   }
   const mag = Math.hypot(rvx, rvy) || 1;
   return {
-    vx: (rvx / mag) * BALL_SPEED,
-    vy: (rvy / mag) * BALL_SPEED,
+    vx: (rvx / mag) * targetSpeed,
+    vy: (rvy / mag) * targetSpeed,
   };
 }
 
@@ -790,6 +1090,7 @@ function activatePickup(state: GameState, pickup: Pickup, ball: Ball): void {
   if (pickup.type === 'multi_ball') {
     const spread = (22 * Math.PI) / 180;
     const baseCount = state.balls.length;
+    const ballSpeed = getCurrentBallSpeed(state);
     let activeTotal = state.balls.filter((b) => b.active && !b.recalling).length;
 
     for (let i = 0; i < baseCount; i++) {
@@ -797,8 +1098,8 @@ function activatePickup(state: GameState, pickup: Pickup, ball: Ball): void {
       if (!src.active || src.recalling) continue;
       if (activeTotal + 2 > MAX_ACTIVE_BALLS) break;
 
-      const left = rotateVelocity(src.vx, src.vy, -spread);
-      const right = rotateVelocity(src.vx, src.vy, spread);
+      const left = rotateVelocity(src.vx, src.vy, -spread, ballSpeed);
+      const right = rotateVelocity(src.vx, src.vy, spread, ballSpeed);
 
       for (const vel of [left, right]) {
         state.balls.push({
@@ -815,6 +1116,7 @@ function activatePickup(state: GameState, pickup: Pickup, ball: Ball): void {
           recallProgress: 0,
           bouncesSinceBlock: 0,
           destroyChain: src.destroyChain,
+          hitChain: src.hitChain,
           trail: [],
         });
       }
@@ -851,6 +1153,7 @@ function activatePickup(state: GameState, pickup: Pickup, ball: Ball): void {
           state.blocksDestroyed += 1;
           addScaledScore(state, 5);
           spawnBlockDestructionBurst(state, block, palette.stroke, 0, 0, 1.15);
+          spawnFloatingBuffFromBlock(state, block);
         }
       }
       if (!hitAny) {
@@ -883,6 +1186,16 @@ function activatePickup(state: GameState, pickup: Pickup, ball: Ball): void {
     ) {
       const palette = getBlockColors(block.hp);
       state.blocksDestroyed += 1;
+      ball.hitChain += 1;
+      if (ball.hitChain >= 2 && ball.hitChain > state.trajectoryCombo) {
+        const prevVoiceTier = getComboVoiceTier(state.trajectoryCombo);
+        state.trajectoryCombo = ball.hitChain;
+        state.trajectoryComboBump += 1;
+        const nextVoiceTier = getComboVoiceTier(state.trajectoryCombo);
+        if (nextVoiceTier !== 0 && nextVoiceTier > prevVoiceTier) {
+          soundEngine.playComboVoice(nextVoiceTier);
+        }
+      }
       ball.destroyChain += 1;
       const mult = Math.min(MAX_CHAIN_MULTIPLIER, ball.destroyChain);
       state.peakChainThisRun = Math.max(state.peakChainThisRun, mult);
@@ -901,6 +1214,7 @@ function activatePickup(state: GameState, pickup: Pickup, ball: Ball): void {
         by - pickup.y,
         1.35
       );
+      spawnFloatingBuffFromBlock(state, block);
     }
   }
 
@@ -929,6 +1243,72 @@ function activatePickup(state: GameState, pickup: Pickup, ball: Ball): void {
   hapticsEngine.pickup('bomb');
 }
 
+function collectFloatingBuff(
+  state: GameState,
+  buff: FloatingBuff
+): void {
+  buff.collected = true;
+  state.powerupsCollected += 1;
+
+  if (buff.type === 'multi_ball') {
+    // Immediate 3-way split on up to 6 active balls + temporary +3 salvo surge for 2 turns
+    const spread = (20 * Math.PI) / 180;
+    const baseCount = state.balls.length;
+    const ballSpeed = getCurrentBallSpeed(state);
+    let activeTotal = state.balls.filter((b) => b.active && !b.recalling).length;
+    let splitSources = 0;
+
+    for (let i = 0; i < baseCount && splitSources < 6; i++) {
+      const src = state.balls[i];
+      if (!src.active || src.recalling) continue;
+      if (activeTotal + 2 > MAX_ACTIVE_BALLS) break;
+
+      const left = rotateVelocity(src.vx, src.vy, -spread, ballSpeed);
+      const right = rotateVelocity(src.vx, src.vy, spread, ballSpeed);
+      for (const vel of [left, right]) {
+        state.balls.push({
+          id: state.nextEntityId++,
+          x: src.x,
+          y: src.y,
+          vx: vel.vx,
+          vy: vel.vy,
+          radius: BALL_RADIUS,
+          active: true,
+          recalling: false,
+          recallStartX: 0,
+          recallStartY: 0,
+          recallProgress: 0,
+          bouncesSinceBlock: 0,
+          destroyChain: src.destroyChain,
+          hitChain: src.hitChain,
+          trail: [],
+        });
+      }
+      activeTotal += 2;
+      splitSources += 1;
+    }
+
+    state.buffMultiBallTurns = Math.min(5, state.buffMultiBallTurns + 2);
+    state.maxBalls = Math.max(state.maxBalls, activeTotal);
+    state.shieldNoticeText = `MULTI-BALL BUFF · +3 SALVO (${state.buffMultiBallTurns}T)`;
+    state.shieldNoticeTimer = 2.0;
+    spawnRadialBurst(state, buff.x, buff.y, '#38bdf8', 22, 62);
+    soundEngine.playMultiBall();
+    hapticsEngine.pickup('multi_ball');
+    return;
+  }
+
+  // Shield Expansion: temporarily expands max shields to 3, adds +1 shield, and widens Aegis barrier for 3 turns
+  state.buffShieldExpandTurns = Math.min(6, state.buffShieldExpandTurns + 3);
+  state.shields = Math.min(MAX_SHIELDS + 1, state.shields + 1);
+  state.shieldFlashTimer = 0.75;
+  state.shieldNoticeText = `SHIELD EXPANSION · WIDE BARRIER (${state.buffShieldExpandTurns}T)`;
+  state.shieldNoticeTimer = 2.1;
+  spawnRadialBurst(state, buff.x, buff.y, '#818cf8', 24, 66);
+  soundEngine.playShieldGain();
+  hapticsEngine.pickup('shield');
+}
+
 function recordBallTrail(ball: Ball, effectiveSpeed: number): void {
   const speedNorm = clamp(effectiveSpeed / BALL_SPEED, 0.5, 2.8);
   const maxPoints = Math.round(clamp(7 + speedNorm * 8, 8, 28));
@@ -949,6 +1329,7 @@ function pushBounceVertex(ball: Ball): void {
 }
 
 function stepBallSubstep(state: GameState, ball: Ball, subDt: number): void {
+  const ballSpeed = getCurrentBallSpeed(state);
   ball.x += ball.vx * subDt;
   ball.y += ball.vy * subDt;
 
@@ -976,8 +1357,8 @@ function stepBallSubstep(state: GameState, ball: Ball, subDt: number): void {
     if (ball.bouncesSinceBlock > 16 && Math.abs(ball.vy) < 70) {
       ball.vy += 65;
       const mag = Math.hypot(ball.vx, ball.vy) || 1;
-      ball.vx = (ball.vx / mag) * BALL_SPEED;
-      ball.vy = (ball.vy / mag) * BALL_SPEED;
+      ball.vx = (ball.vx / mag) * ballSpeed;
+      ball.vy = (ball.vy / mag) * ballSpeed;
     }
   }
 
@@ -999,6 +1380,17 @@ function stepBallSubstep(state: GameState, ball: Ball, subDt: number): void {
     const hitDist = ball.radius + pickup.radius + 3;
     if (dx * dx + dy * dy <= hitDist * hitDist) {
       activatePickup(state, pickup, ball);
+    }
+  }
+
+  // Floating buff icons spawned by destroyed Power-up bricks
+  for (const buff of state.floatingBuffs) {
+    if (buff.collected) continue;
+    const dx = ball.x - buff.x;
+    const dy = ball.y - buff.y;
+    const hitDist = ball.radius + buff.radius + 5;
+    if (dx * dx + dy * dy <= hitDist * hitDist) {
+      collectFloatingBuff(state, buff);
     }
   }
 
@@ -1035,8 +1427,8 @@ function stepBallSubstep(state: GameState, ball: Ball, subDt: number): void {
           ball.vx -= 2 * dot * nx;
           ball.vy -= 2 * dot * ny;
           const mag = Math.hypot(ball.vx, ball.vy) || 1;
-          ball.vx = (ball.vx / mag) * BALL_SPEED;
-          ball.vy = (ball.vy / mag) * BALL_SPEED;
+          ball.vx = (ball.vx / mag) * ballSpeed;
+          ball.vy = (ball.vy / mag) * ballSpeed;
         }
         ball.bouncesSinceBlock = 0;
         pushBounceVertex(ball);
@@ -1065,8 +1457,8 @@ function stepBallSubstep(state: GameState, ball: Ball, subDt: number): void {
           ball.vx -= 2 * dot * nx;
           ball.vy -= 2 * dot * ny;
           const mag = Math.hypot(ball.vx, ball.vy) || 1;
-          ball.vx = (ball.vx / mag) * BALL_SPEED;
-          ball.vy = (ball.vy / mag) * BALL_SPEED;
+          ball.vx = (ball.vx / mag) * ballSpeed;
+          ball.vy = (ball.vy / mag) * ballSpeed;
         }
         ball.bouncesSinceBlock = 0;
         pushBounceVertex(ball);
@@ -1087,16 +1479,30 @@ function finishTurn(state: GameState): void {
   state.balls = [];
   state.recallActive = false;
   state.combo = 0;
+  state.trajectoryCombo = 0;
   if (state.turnPeakMultiplier >= 2) {
     state.multiplierHudResetting = true;
   }
   state.turn += 1;
 
-  const nextTier = getDifficultyTier(state.turn);
-  if (nextTier > state.difficultyTier) {
-    state.difficultyTier = nextTier;
-    state.tierBannerText = `Tier ${nextTier} · Difficulty Escalated`;
-    state.tierBannerTimer = 2.2;
+  const nextStage = getDifficultyTier(state.turn, state.difficultyMode);
+  const stageMeta = getStageMetadata(nextStage);
+  state.stageSpeedMult = stageMeta.speedMult;
+
+  if (nextStage > state.difficultyTier) {
+    state.difficultyTier = nextStage;
+    state.tierBannerText = `STAGE ${nextStage} · ${stageMeta.title.toUpperCase()} (${stageMeta.speedMult.toFixed(2)}× SPD)`;
+    state.tierBannerTimer = 2.6;
+    state.shockwaves.push({
+      x: LOGICAL_WIDTH / 2,
+      y: TOP_OFFSET + CELL_SIZE / 2,
+      radius: 16,
+      maxRadius: LOGICAL_WIDTH * 0.55,
+      color: '#fbbf24',
+      life: 0.45,
+      maxLife: 0.45,
+    });
+    soundEngine.playStageUp(nextStage);
   }
 
   for (const block of state.blocks) {
@@ -1238,12 +1644,51 @@ export function stepGame(state: GameState, rawDt: number): boolean {
     pickup.pulsePhase += dt * 4;
   }
 
+  // Floating buff icon animation (bobbing in AIMING, drifting & aging during active play)
+  for (let i = state.floatingBuffs.length - 1; i >= 0; i--) {
+    const buff = state.floatingBuffs[i];
+    if (buff.collected) {
+      state.floatingBuffs.splice(i, 1);
+      continue;
+    }
+    buff.bobPhase += dt * 4.2;
+    if (state.phase === 'FIRING' || state.phase === 'FLYING' || state.phase === 'SHIFTING') {
+      buff.life -= dt;
+      if (buff.life <= 0) {
+        state.floatingBuffs.splice(i, 1);
+        continue;
+      }
+      // Gravity pulls initial upward pop down into a gentle float above the floor line
+      buff.vy = Math.min(54, buff.vy + 220 * dt);
+      buff.x += buff.vx * dt;
+      buff.y += buff.vy * dt;
+      buff.vx *= Math.exp(-1.5 * dt);
+
+      if (buff.x < buff.radius + 12) {
+        buff.x = buff.radius + 12;
+        buff.vx = Math.abs(buff.vx) * 0.7;
+      } else if (buff.x > LOGICAL_WIDTH - buff.radius - 12) {
+        buff.x = LOGICAL_WIDTH - buff.radius - 12;
+        buff.vx = -Math.abs(buff.vx) * 0.7;
+      }
+
+      const maxFloatY = FLOOR_Y - 34;
+      if (buff.y > maxFloatY) {
+        buff.y = maxFloatY;
+        buff.vy = 0;
+      }
+    }
+  }
+
   if (state.phase === 'AIMING' || state.phase === 'GAME_OVER') {
     return false;
   }
 
+  const stageMeta = getStageMetadata(state.difficultyTier);
+  const ballSpeed = getCurrentBallSpeed(state);
+
   if (state.phase === 'SHIFTING') {
-    state.shiftTimer = Math.max(0, state.shiftTimer - dt);
+    state.shiftTimer = Math.max(0, state.shiftTimer - dt * stageMeta.shiftSpeedMult);
     const t = 1 - state.shiftTimer / SHIFT_DURATION;
     const ease = 1 - Math.pow(1 - t, 3);
 
@@ -1271,13 +1716,45 @@ export function stepGame(state: GameState, rawDt: number): boolean {
         }
       }
 
-      const breachingBlocks = state.blocks.filter((b) => b.row >= DANGER_ROW);
-      if (breachingBlocks.length > 0) {
+      const isShieldExpanded = state.buffShieldExpandTurns > 0;
+
+      // Expanded Shield Energy Field zaps bricks entering the row right above DANGER_ROW
+      if (isShieldExpanded && state.shields > 0) {
+        for (const block of state.blocks) {
+          if (block.hp <= 0 || block.row !== DANGER_ROW - 1) continue;
+          const dmg = Math.min(block.hp, 2);
+          block.hp -= dmg;
+          block.flashTimer = 0.14;
+          addScaledScore(state, dmg);
+          if (block.hp <= 0) {
+            state.blocksDestroyed += 1;
+            addScaledScore(state, 5);
+            spawnBlockDestructionBurst(state, block, '#818cf8', 0, -140, 1.15);
+            spawnFloatingBuffFromBlock(state, block);
+          }
+        }
+        for (let i = state.blocks.length - 1; i >= 0; i--) {
+          if (state.blocks[i].hp <= 0) {
+            state.blocks.splice(i, 1);
+          }
+        }
+      }
+
+      const breachThresholdRow =
+        isShieldExpanded && state.shields > 0 ? DANGER_ROW - 1 : DANGER_ROW;
+      const hasHardBreach = state.blocks.some((b) => b.row >= DANGER_ROW);
+      const breachingBlocks = hasHardBreach
+        ? state.blocks.filter((b) => b.row >= breachThresholdRow)
+        : [];
+
+      if (hasHardBreach) {
         if (state.shields > 0) {
           state.shields -= 1;
-          state.shieldFlashTimer = 0.8;
-          state.shieldNoticeText =
-            state.shields > 0
+          state.shieldSavesThisRun += 1;
+          state.shieldFlashTimer = 0.85;
+          state.shieldNoticeText = isShieldExpanded
+            ? 'EXPANDED SHIELD · 2 ROWS CLEARED'
+            : state.shields > 0
               ? `SHIELD SAVED · ${state.shields} LEFT`
               : 'SHIELD SHATTERED · BREACH CLEARED';
           state.shieldNoticeTimer = 2.3;
@@ -1289,6 +1766,7 @@ export function stepGame(state: GameState, rawDt: number): boolean {
             addScaledScore(state, Math.max(5, block.hp));
             block.hp = 0;
             spawnBlockDestructionBurst(state, block, '#38bdf8', 0, -240, 1.35);
+            spawnFloatingBuffFromBlock(state, block);
             spawnRadialBurst(state, bx, DANGER_Y, '#818cf8', 12, ROW_STEP * 1.15);
           }
 
@@ -1320,6 +1798,14 @@ export function stepGame(state: GameState, rawDt: number): boolean {
       } else {
         state.phase = 'AIMING';
       }
+
+      if (state.buffShieldExpandTurns > 0) {
+        state.buffShieldExpandTurns -= 1;
+        if (state.buffShieldExpandTurns === 0 && state.shields > MAX_SHIELDS) {
+          state.shields = MAX_SHIELDS;
+        }
+      }
+
       snapshotChanged = true;
     }
     return snapshotChanged;
@@ -1328,6 +1814,7 @@ export function stepGame(state: GameState, rawDt: number): boolean {
   // FIRING or FLYING phase
   const speedMult = state.fastForward ? 2 : 1;
   const simDt = dt * speedMult;
+  const effectiveFireInterval = FIRE_INTERVAL / stageMeta.fireCadenceMult;
 
   if (state.phase === 'FIRING' && !state.recallActive) {
     state.fireCooldown -= simDt;
@@ -1336,8 +1823,8 @@ export function stepGame(state: GameState, rawDt: number): boolean {
         id: state.nextEntityId++,
         x: state.launchX,
         y: FLOOR_Y - BALL_RADIUS,
-        vx: Math.cos(state.launchAngleRad) * BALL_SPEED,
-        vy: -Math.sin(state.launchAngleRad) * BALL_SPEED,
+        vx: Math.cos(state.launchAngleRad) * ballSpeed,
+        vy: -Math.sin(state.launchAngleRad) * ballSpeed,
         radius: BALL_RADIUS,
         active: true,
         recalling: false,
@@ -1346,6 +1833,7 @@ export function stepGame(state: GameState, rawDt: number): boolean {
         recallProgress: 0,
         bouncesSinceBlock: 0,
         destroyChain: 0,
+        hitChain: 0,
         trail: [],
       });
 
@@ -1353,7 +1841,7 @@ export function stepGame(state: GameState, rawDt: number): boolean {
         soundEngine.playLaunch();
       }
       state.ballsToFire -= 1;
-      state.fireCooldown += FIRE_INTERVAL;
+      state.fireCooldown += effectiveFireInterval;
       snapshotChanged = true;
     }
 
@@ -1367,7 +1855,7 @@ export function stepGame(state: GameState, rawDt: number): boolean {
   const targetY = FLOOR_Y - BALL_RADIUS;
 
   const maxStep = BALL_RADIUS * 0.45;
-  const frameDist = BALL_SPEED * simDt;
+  const frameDist = ballSpeed * simDt;
   const subSteps = Math.max(1, Math.ceil(frameDist / maxStep));
   const subDt = simDt / subSteps;
 
@@ -1397,17 +1885,24 @@ export function stepGame(state: GameState, rawDt: number): boolean {
 
     const prevScore = state.score;
     const prevExtra = state.pendingExtraBalls;
+    const prevShields = state.shields;
+    const prevTrajectoryCombo = state.trajectoryCombo;
     for (let s = 0; s < subSteps; s++) {
       if (!ball.active) break;
       stepBallSubstep(state, ball, subDt);
     }
 
-    if (state.score !== prevScore || state.pendingExtraBalls !== prevExtra) {
+    if (
+      state.score !== prevScore ||
+      state.pendingExtraBalls !== prevExtra ||
+      state.shields !== prevShields ||
+      state.trajectoryCombo !== prevTrajectoryCombo
+    ) {
       snapshotChanged = true;
     }
 
     if (ball.active) {
-      recordBallTrail(ball, BALL_SPEED * speedMult);
+      recordBallTrail(ball, ballSpeed * speedMult);
     }
   }
 
@@ -1446,8 +1941,13 @@ export function restoreGameStateFromSnapshot(
     blocksDestroyed: number;
     bombsDetonated: number;
     scoreRemainder: number;
+    difficultyMode?: DifficultyMode;
     difficultyTier: number;
     shields?: number;
+    shieldSavesThisRun?: number;
+    buffMultiBallTurns?: number;
+    buffShieldExpandTurns?: number;
+    dailyRewardBonus?: DailyRewardChoice | null;
     nextEntityId: number;
     blocks: GameState['blocks'];
     pickups: GameState['pickups'];
@@ -1455,6 +1955,30 @@ export function restoreGameStateFromSnapshot(
   dailyScoreMultiplier = 1
 ): GameState {
   const bestScore = Math.max(loadBestScore(), snapshot.bestScore || 0);
+  const mode: DifficultyMode =
+    snapshot.difficultyMode === 'relaxed' ||
+    snapshot.difficultyMode === 'overdrive' ||
+    snapshot.difficultyMode === 'standard'
+      ? snapshot.difficultyMode
+      : 'standard';
+  const cfg = DIFFICULTY_CONFIGS[mode];
+  const resolvedStage = Math.max(
+    getDifficultyTier(snapshot.turn, mode),
+    snapshot.difficultyTier || 1
+  );
+  const stageMeta = getStageMetadata(resolvedStage);
+  const buffShieldExpandTurns = snapshot.buffShieldExpandTurns ?? 0;
+  const dailyRewardBonus: DailyRewardChoice | null =
+    snapshot.dailyRewardBonus === 'multiplier_boost' ||
+    snapshot.dailyRewardBonus === 'starter_shield'
+      ? snapshot.dailyRewardBonus
+      : null;
+  const maxShieldCap =
+    buffShieldExpandTurns > 0 || dailyRewardBonus === 'starter_shield'
+      ? MAX_SHIELDS + 1
+      : MAX_SHIELDS;
+  const rewardMultBonus =
+    dailyRewardBonus === 'multiplier_boost' ? DAILY_REWARD_MULTIPLIER_BOOST : 0;
   return {
     phase: 'AIMING',
     score: snapshot.score,
@@ -1476,6 +2000,8 @@ export function restoreGameStateFromSnapshot(
     shakeKickX: 0,
     shakeKickY: 0,
     combo: 0,
+    trajectoryCombo: 0,
+    trajectoryComboBump: 0,
     turnPeakMultiplier: 0,
     turnPeakMultiplierTimer: 0,
     multiplierHudAlpha: 0,
@@ -1485,23 +2011,31 @@ export function restoreGameStateFromSnapshot(
     peakChainThisRun: snapshot.peakChainThisRun,
     blocksDestroyed: snapshot.blocksDestroyed,
     bombsDetonated: snapshot.bombsDetonated,
-    dailyScoreMultiplier: Math.max(1, dailyScoreMultiplier),
+    dailyScoreMultiplier:
+      Math.round((Math.max(1, dailyScoreMultiplier) + rewardMultBonus) * 100) / 100,
+    dailyRewardBonus,
     scoreRemainder: snapshot.scoreRemainder,
     isNewBest: snapshot.score > 0 && snapshot.score >= bestScore,
     hasTakenFirstShot: true,
-    difficultyTier: snapshot.difficultyTier || getDifficultyTier(snapshot.turn),
+    difficultyMode: mode,
+    difficultyTier: resolvedStage,
+    stageSpeedMult: stageMeta.speedMult,
     tierBannerText: null,
     tierBannerTimer: 0,
     shields:
       typeof snapshot.shields === 'number'
-        ? clamp(snapshot.shields, 0, MAX_SHIELDS)
-        : 1,
+        ? clamp(snapshot.shields, 0, maxShieldCap)
+        : cfg.startingShields,
+    shieldSavesThisRun: snapshot.shieldSavesThisRun ?? 0,
     shieldFlashTimer: 0,
     shieldNoticeText: null,
     shieldNoticeTimer: 0,
+    buffMultiBallTurns: snapshot.buffMultiBallTurns ?? 0,
+    buffShieldExpandTurns,
     nextEntityId: snapshot.nextEntityId,
     blocks: snapshot.blocks.map((b) => ({ ...b, flashTimer: 0, hitScale: 0 })),
     pickups: snapshot.pickups.map((p) => ({ ...p })),
+    floatingBuffs: [],
     balls: [],
     particles: [],
     shockwaves: [],

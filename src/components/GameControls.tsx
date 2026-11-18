@@ -66,7 +66,7 @@ export function GameControls({
             className="min-h-[44px] px-3 py-2 rounded-xl bg-slate-800/85 hover:bg-slate-700/85 border border-slate-700/80 text-slate-100 text-xs font-semibold flex items-center gap-2 transition-colors active:scale-[0.98] whitespace-nowrap shrink-0"
           >
             <Target className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>Missions</span>
+            <span>Quests</span>
             <span className="font-mono-num text-slate-400">
               {missionsCompleted}/{missionsTotal}
             </span>

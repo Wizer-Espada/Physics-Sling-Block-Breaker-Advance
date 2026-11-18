@@ -1,7 +1,60 @@
 export type GamePhase = 'AIMING' | 'FIRING' | 'FLYING' | 'SHIFTING' | 'GAME_OVER';
 
+export type DifficultyMode = 'relaxed' | 'standard' | 'overdrive';
+
+export interface DifficultyConfig {
+  id: DifficultyMode;
+  label: string;
+  hpMult: number;
+  hpLabel: string;
+  startingShields: number;
+  scoreMult: number;
+  specialChanceBonus: number;
+  startTierOffset: number;
+  description: string;
+}
+
+export const DIFFICULTY_CONFIGS: Record<DifficultyMode, DifficultyConfig> = {
+  relaxed: {
+    id: 'relaxed',
+    label: 'Relaxed',
+    hpMult: 0.78,
+    hpLabel: '0.8× HP',
+    startingShields: 2,
+    scoreMult: 0.85,
+    specialChanceBonus: 0.1,
+    startTierOffset: 0,
+    description: 'Lower brick HP, 2 starting Aegis shields, and boosted power-up drops.',
+  },
+  standard: {
+    id: 'standard',
+    label: 'Standard',
+    hpMult: 1.0,
+    hpLabel: '1.0× HP',
+    startingShields: 1,
+    scoreMult: 1.0,
+    specialChanceBonus: 0,
+    startTierOffset: 0,
+    description: 'Balanced arcade progression with 1 starting shield and new stages every 5 turns.',
+  },
+  overdrive: {
+    id: 'overdrive',
+    label: 'Overdrive',
+    hpMult: 1.35,
+    hpLabel: '1.35× HP',
+    startingShields: 0,
+    scoreMult: 1.4,
+    specialChanceBonus: -0.04,
+    startTierOffset: 1,
+    description: 'Zero starting shields, Stage 2 speed & formations from Turn 1, and 1.4× score.',
+  },
+};
+
 export type BlockShape = 'rect' | 'circle';
+export type BlockKind = 'standard' | 'powerup';
+export type BuffType = 'multi_ball' | 'shield_expansion';
 export type PickupType = 'extra_ball' | 'multi_ball' | 'bomb' | 'shield';
+export type DailyRewardChoice = 'multiplier_boost' | 'starter_shield';
 
 export interface Block {
   id: number;
@@ -14,9 +67,25 @@ export interface Block {
   hp: number;
   maxHp: number;
   shape: BlockShape;
+  kind?: BlockKind;
+  powerupReward?: BuffType;
   armored?: boolean;
   flashTimer: number;
   hitScale: number;
+}
+
+export interface FloatingBuff {
+  id: number;
+  type: BuffType;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  radius: number;
+  bobPhase: number;
+  life: number;
+  maxLife: number;
+  collected: boolean;
 }
 
 export interface Pickup {
@@ -45,6 +114,7 @@ export interface Ball {
   recallProgress: number;
   bouncesSinceBlock: number;
   destroyChain: number;
+  hitChain: number;
   trail: Array<{ x: number; y: number }>;
 }
 
@@ -117,6 +187,8 @@ export interface GameState {
   shakeKickX: number;
   shakeKickY: number;
   combo: number;
+  trajectoryCombo: number;
+  trajectoryComboBump: number;
   turnPeakMultiplier: number;
   turnPeakMultiplierTimer: number;
   multiplierHudAlpha: number;
@@ -127,19 +199,26 @@ export interface GameState {
   blocksDestroyed: number;
   bombsDetonated: number;
   dailyScoreMultiplier: number;
+  dailyRewardBonus: DailyRewardChoice | null;
   scoreRemainder: number;
   isNewBest: boolean;
   hasTakenFirstShot: boolean;
+  difficultyMode: DifficultyMode;
   difficultyTier: number;
+  stageSpeedMult: number;
   tierBannerText: string | null;
   tierBannerTimer: number;
   shields: number;
+  shieldSavesThisRun: number;
   shieldFlashTimer: number;
   shieldNoticeText: string | null;
   shieldNoticeTimer: number;
+  buffMultiBallTurns: number;
+  buffShieldExpandTurns: number;
   nextEntityId: number;
   blocks: Block[];
   pickups: Pickup[];
+  floatingBuffs: FloatingBuff[];
   balls: Ball[];
   particles: Particle[];
   shockwaves: Shockwave[];

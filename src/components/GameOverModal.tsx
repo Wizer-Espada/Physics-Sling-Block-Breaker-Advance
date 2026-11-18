@@ -1,9 +1,13 @@
-import { RotateCcw, Target, Trophy } from 'lucide-react';
+import { Crown, Home, RotateCcw, Target, Trophy } from 'lucide-react';
+import { DIFFICULTY_CONFIGS, DifficultyMode } from '../game/types.ts';
+import { LeaderboardEntry } from './LeaderboardDrawer.tsx';
 
 interface GameOverModalProps {
   score: number;
   bestScore: number;
+  topGlobalScore: LeaderboardEntry | null;
   turn: number;
+  difficultyMode: DifficultyMode;
   powerupsCollected: number;
   dailyMultiplier: number;
   missionsCompleted: number;
@@ -12,6 +16,7 @@ interface GameOverModalProps {
   isNewBest: boolean;
   cloudSaved: boolean;
   onPlayAgain: () => void;
+  onGoHome: () => void;
   onOpenLeaderboard: () => void;
   onOpenMissions: () => void;
 }
@@ -21,7 +26,9 @@ const GAME_LOGO_URL = '/src/assets/images/prism_sling_logo_1794866373917.jpg';
 export function GameOverModal({
   score,
   bestScore,
+  topGlobalScore,
   turn,
+  difficultyMode,
   powerupsCollected,
   dailyMultiplier,
   missionsCompleted,
@@ -30,6 +37,7 @@ export function GameOverModal({
   isNewBest,
   cloudSaved,
   onPlayAgain,
+  onGoHome,
   onOpenLeaderboard,
   onOpenMissions,
 }: GameOverModalProps) {
@@ -38,7 +46,7 @@ export function GameOverModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="gameover-2d-title"
-      className="absolute inset-0 z-20 flex items-center justify-center p-5 bg-[#070b14]/88"
+      className="fixed inset-0 z-20 flex items-center justify-center p-5 bg-[#070b14]/88"
     >
       <div className="w-full max-w-[340px] rounded-2xl bg-[#0b1120] border border-slate-700/85 p-6 text-center shadow-2xl">
         <div className="w-14 h-14 mx-auto mb-3 rounded-2xl overflow-hidden border border-slate-700/80 bg-slate-900 shadow-lg">
@@ -77,22 +85,45 @@ export function GameOverModal({
           </div>
         </div>
 
-        <div className="mt-3 text-xs text-slate-400 font-mono-num">
-          Turn {turn} · {powerupsCollected} Power-Ups
+        {topGlobalScore && (
+          <div className="mt-2.5 flex items-center justify-center gap-1.5 text-xs font-mono-num text-amber-300">
+            <Crown className="w-3.5 h-3.5 shrink-0" />
+            <span>
+              {topGlobalScore.isYou && score >= topGlobalScore.score
+                ? `Global #1 · ${topGlobalScore.score.toLocaleString()}`
+                : `Top Score · ${topGlobalScore.score.toLocaleString()} (${topGlobalScore.playerName})`}
+            </span>
+          </div>
+        )}
+
+        <div className="mt-2.5 text-xs text-slate-400 font-mono-num">
+          {DIFFICULTY_CONFIGS[difficultyMode].label} · Turn {turn} · {powerupsCollected} Power-Ups
           {playStreak > 0 ? ` · ${playStreak}d Streak` : ''}
           {dailyMultiplier > 1 ? ` · ${dailyMultiplier.toFixed(2)}×` : ''}
-          {cloudSaved ? ' · Saved' : ''}
+          {cloudSaved ? ' · Ranked' : ''}
         </div>
 
         <div className="mt-5 flex flex-col gap-2.5">
-          <button
-            type="button"
-            onClick={onPlayAgain}
-            className="w-full min-h-[48px] px-5 py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 transition-colors active:scale-[0.98] whitespace-nowrap"
-          >
-            <RotateCcw className="w-4 h-4 shrink-0" />
-            <span>Play Again</span>
-          </button>
+          <div className="grid grid-cols-[1fr_auto] gap-2">
+            <button
+              type="button"
+              onClick={onPlayAgain}
+              className="min-h-[48px] px-5 py-3 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 transition-colors active:scale-[0.98] whitespace-nowrap"
+            >
+              <RotateCcw className="w-4 h-4 shrink-0" />
+              <span>Play Again</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onGoHome}
+              aria-label="Home menu"
+              className="min-h-[48px] px-4 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-sm flex items-center justify-center gap-1.5 transition-colors active:scale-[0.98] whitespace-nowrap"
+            >
+              <Home className="w-4 h-4 shrink-0" />
+              <span>Home</span>
+            </button>
+          </div>
 
           <div className="grid grid-cols-2 gap-2">
             <button
@@ -102,7 +133,7 @@ export function GameOverModal({
             >
               <Target className="w-4 h-4 text-emerald-400 shrink-0" />
               <span>
-                Missions {missionsCompleted}/{missionsTotal}
+                Quests {missionsCompleted}/{missionsTotal}
               </span>
             </button>
 

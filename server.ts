@@ -5,12 +5,26 @@ import { GoogleGenAI } from '@google/genai';
 import {
   deleteUserSoundtrack,
   getGlobalLeaderboard,
+  getRecentGlobalActivity,
   getUserProfileSummary,
   getUserSoundtracks,
   recordGameRun,
   saveSoundtrackRecord,
+  updatePlayerDisplayName,
 } from './src/db/users.ts';
 import { optionalAuth, requireAuth, type AuthRequest } from './src/middleware/auth.ts';
+
+function sanitizeGuestId(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return /^guest_[a-zA-Z0-9_-]{8,36}$/.test(trimmed) ? trimmed : null;
+}
+
+function sanitizePlayerName(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.replace(/\s+/g, ' ').trim().slice(0, 20);
+  return cleaned.length > 0 ? cleaned : null;
+}
 
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -30,14 +44,39 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  // Public global leaderboard from Cloud SQL
-  app.get('/api/leaderboard', async (_req, res) => {
+  // Public global leaderboard from Cloud SQL (ranked by each player's personal best score)
+  app.get('/api/leaderboard', optionalAuth, async (req: AuthRequest, res) => {
     try {
-      const entries = await getGlobalLeaderboard(15);
-      res.json({ entries });
+      const guestId = sanitizeGuestId(
+        req.query.guestId ?? req.headers['x-guest-id']
+      );
+      const currentUid = req.user?.uid ?? guestId;
+      const leaderboardData = await getGlobalLeaderboard(20, currentUid);
+      res.json(leaderboardData);
     } catch (error: unknown) {
       const message =
         error instanceof Error ? error.message : 'Failed to load leaderboard.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // Public global activity feed from Cloud SQL (recent scores from other players)
+  app.get('/api/global-activity', optionalAuth, async (req: AuthRequest, res) => {
+    try {
+      const guestId = sanitizeGuestId(
+        req.query.guestId ?? req.headers['x-guest-id']
+      );
+      const excludeUids = [req.user?.uid, guestId].filter(
+        (id): id is string => Boolean(id)
+      );
+      const entries = await getRecentGlobalActivity(20, excludeUids);
+      res.json({
+        entries,
+        fetchedAt: new Date().toISOString(),
+      });
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : 'Failed to load global activity.';
       res.status(500).json({ error: message });
     }
   });
@@ -62,15 +101,35 @@ async function startServer() {
     }
   });
 
-  // Save a completed 3D game run to Cloud SQL
-  app.post('/api/runs', requireAuth, async (req: AuthRequest, res) => {
+  // Save a completed game run (signed-in player or persistent guest ID) to Cloud SQL
+  app.post('/api/runs', optionalAuth, async (req: AuthRequest, res) => {
     try {
-      const uid = req.user!.uid;
-      const email = req.user!.email ?? `${uid}@player.local`;
-      const displayName = (req.user!.name as string | undefined) ?? null;
+      const guestId = sanitizeGuestId(req.body?.guestId);
+      const customName = sanitizePlayerName(req.body?.playerName);
+
+      if (!req.user && !guestId) {
+        return res.status(401).json({ error: 'Missing player identity.' });
+      }
+
+      const uid = req.user ? req.user.uid : guestId!;
+      const email = req.user
+        ? (req.user.email ?? `${uid}@player.local`)
+        : `${uid}@guest.local`;
+      const displayName =
+        customName ??
+        (req.user ? ((req.user.name as string | undefined) ?? null) : null);
 
       const { score, turn, maxBalls, powerupsCollected } = req.body ?? {};
-      if (typeof score !== 'number' || typeof turn !== 'number') {
+      if (
+        typeof score !== 'number' ||
+        !Number.isFinite(score) ||
+        score < 0 ||
+        score > 10_000_000 ||
+        typeof turn !== 'number' ||
+        !Number.isFinite(turn) ||
+        turn < 1 ||
+        turn > 5000
+      ) {
         return res.status(400).json({ error: 'Invalid run payload.' });
       }
 
@@ -85,15 +144,52 @@ async function startServer() {
           typeof powerupsCollected === 'number' ? powerupsCollected : 0,
       });
 
-      const [profile, entries] = await Promise.all([
-        getUserProfileSummary(uid, email, displayName),
-        getGlobalLeaderboard(15),
+      const [profile, leaderboardData] = await Promise.all([
+        req.user ? getUserProfileSummary(uid, email, displayName) : Promise.resolve(null),
+        getGlobalLeaderboard(20, uid),
       ]);
 
-      res.json({ run, profile, entries });
+      res.json({
+        run,
+        profile,
+        ...leaderboardData,
+      });
     } catch (error: unknown) {
       const message =
         error instanceof Error ? error.message : 'Failed to record game run.';
+      res.status(500).json({ error: message });
+    }
+  });
+
+  // Update player's public leaderboard callsign
+  app.post('/api/player-name', optionalAuth, async (req: AuthRequest, res) => {
+    try {
+      const guestId = sanitizeGuestId(req.body?.guestId);
+      const cleanName = sanitizePlayerName(req.body?.playerName);
+
+      if (!req.user && !guestId) {
+        return res.status(401).json({ error: 'Missing player identity.' });
+      }
+      if (!cleanName) {
+        return res.status(400).json({ error: 'Enter a valid callsign (1-20 characters).' });
+      }
+
+      const uid = req.user ? req.user.uid : guestId!;
+      const email = req.user
+        ? (req.user.email ?? `${uid}@player.local`)
+        : `${uid}@guest.local`;
+
+      await updatePlayerDisplayName({
+        uid,
+        email,
+        displayName: cleanName,
+      });
+
+      const leaderboardData = await getGlobalLeaderboard(20, uid);
+      res.json({ playerName: cleanName, ...leaderboardData });
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : 'Failed to update player name.';
       res.status(500).json({ error: message });
     }
   });

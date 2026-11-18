@@ -1,4 +1,4 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { db } from './index.ts';
 import { gameRuns, soundtracks, users } from './schema.ts';
 
@@ -135,38 +135,266 @@ export async function getUserProfileSummary(
   }
 }
 
-export async function getGlobalLeaderboard(limitCount = 12) {
-  try {
-    const rows = await db
-      .select({
-        id: gameRuns.id,
-        score: gameRuns.score,
-        turn: gameRuns.turn,
-        maxBalls: gameRuns.maxBalls,
-        powerupsCollected: gameRuns.powerupsCollected,
-        createdAt: gameRuns.createdAt,
-        displayName: users.displayName,
-        email: users.email,
-      })
-      .from(gameRuns)
-      .innerJoin(users, eq(gameRuns.userId, users.id))
-      .orderBy(desc(gameRuns.score), desc(gameRuns.turn), desc(gameRuns.createdAt))
-      .limit(limitCount);
+function formatPublicPlayerName(params: {
+  displayName: string | null;
+  email: string;
+  uid: string;
+}): string {
+  const trimmed = params.displayName?.trim();
+  if (trimmed) return trimmed;
+  if (params.uid.startsWith('guest_')) {
+    return `Player-${params.uid.slice(-4).toUpperCase()}`;
+  }
+  return params.email ? params.email.split('@')[0] : 'Player';
+}
 
-    return rows.map((row) => ({
-      id: row.id,
-      playerName:
-        row.displayName?.trim() ||
-        (row.email ? row.email.split('@')[0] : 'Player'),
-      score: row.score,
-      turn: row.turn,
-      maxBalls: row.maxBalls,
-      powerupsCollected: row.powerupsCollected,
-      createdAt: row.createdAt,
+export async function updatePlayerDisplayName(params: {
+  uid: string;
+  email: string;
+  displayName: string;
+}) {
+  const cleanName = params.displayName.replace(/\s+/g, ' ').trim().slice(0, 20);
+  if (!cleanName) {
+    throw new Error('Player name cannot be empty.');
+  }
+
+  const [user] = await db
+    .insert(users)
+    .values({
+      uid: params.uid,
+      email: params.email,
+      displayName: cleanName,
+    })
+    .onConflictDoUpdate({
+      target: users.uid,
+      set: {
+        displayName: cleanName,
+      },
+    })
+    .returning();
+
+  return user;
+}
+
+interface RankedRow {
+  id: number;
+  uid: string;
+  display_name: string | null;
+  email: string;
+  score: number;
+  turn: number;
+  max_balls: number;
+  powerups_collected: number;
+  created_at: Date | string;
+  rank: number;
+}
+
+export async function getGlobalLeaderboard(
+  limitCount = 20,
+  currentUid?: string | null
+) {
+  try {
+    const topResult = await db.execute(sql`
+      WITH best_per_player AS (
+        SELECT DISTINCT ON (gr.user_id)
+          gr.id,
+          u.uid,
+          u.display_name,
+          u.email,
+          gr.score,
+          gr.turn,
+          gr.max_balls,
+          gr.powerups_collected,
+          gr.created_at
+        FROM game_runs gr
+        INNER JOIN users u ON gr.user_id = u.id
+        WHERE gr.score > 0
+        ORDER BY gr.user_id, gr.score DESC, gr.turn DESC, gr.created_at ASC
+      ),
+      ranked AS (
+        SELECT
+          id,
+          uid,
+          display_name,
+          email,
+          score,
+          turn,
+          max_balls,
+          powerups_collected,
+          created_at,
+          ROW_NUMBER() OVER (ORDER BY score DESC, turn DESC, created_at ASC)::int AS rank
+        FROM best_per_player
+      )
+      SELECT * FROM ranked
+      ORDER BY rank ASC
+      LIMIT ${limitCount}
+    `);
+
+    const countResult = await db.execute(sql`
+      SELECT COUNT(DISTINCT user_id)::int AS total_players
+      FROM game_runs
+      WHERE score > 0
+    `);
+
+    const topRows = topResult.rows as unknown as RankedRow[];
+    const totalPlayers = Number(
+      (countResult.rows[0] as { total_players?: number } | undefined)?.total_players ?? 0
+    );
+
+    const entries = topRows.map((row) => ({
+      id: Number(row.id),
+      rank: Number(row.rank),
+      playerName: formatPublicPlayerName({
+        displayName: row.display_name,
+        email: row.email,
+        uid: row.uid,
+      }),
+      score: Number(row.score),
+      turn: Number(row.turn),
+      maxBalls: Number(row.max_balls),
+      powerupsCollected: Number(row.powerups_collected),
+      createdAt:
+        row.created_at instanceof Date
+          ? row.created_at.toISOString()
+          : String(row.created_at),
+      isYou: Boolean(currentUid && row.uid === currentUid),
     }));
+
+    let myRank: {
+      rank: number;
+      playerName: string;
+      score: number;
+      turn: number;
+    } | null = null;
+
+    if (currentUid) {
+      const inTop = entries.find((e) => e.isYou);
+      if (inTop) {
+        myRank = {
+          rank: inTop.rank,
+          playerName: inTop.playerName,
+          score: inTop.score,
+          turn: inTop.turn,
+        };
+      } else {
+        const selfResult = await db.execute(sql`
+          WITH best_per_player AS (
+            SELECT DISTINCT ON (gr.user_id)
+              u.uid,
+              u.display_name,
+              u.email,
+              gr.score,
+              gr.turn,
+              gr.created_at
+            FROM game_runs gr
+            INNER JOIN users u ON gr.user_id = u.id
+            WHERE gr.score > 0
+            ORDER BY gr.user_id, gr.score DESC, gr.turn DESC, gr.created_at ASC
+          ),
+          ranked AS (
+            SELECT
+              uid,
+              display_name,
+              email,
+              score,
+              turn,
+              ROW_NUMBER() OVER (ORDER BY score DESC, turn DESC, created_at ASC)::int AS rank
+            FROM best_per_player
+          )
+          SELECT * FROM ranked WHERE uid = ${currentUid} LIMIT 1
+        `);
+
+        const selfRow = selfResult.rows[0] as unknown as RankedRow | undefined;
+        if (selfRow) {
+          myRank = {
+            rank: Number(selfRow.rank),
+            playerName: formatPublicPlayerName({
+              displayName: selfRow.display_name,
+              email: selfRow.email,
+              uid: selfRow.uid,
+            }),
+            score: Number(selfRow.score),
+            turn: Number(selfRow.turn),
+          };
+        }
+      }
+    }
+
+    return {
+      entries,
+      topScore: entries[0] ?? null,
+      totalPlayers,
+      myRank,
+    };
   } catch (error) {
     console.error('Database error in getGlobalLeaderboard:', error);
     throw new Error('Failed to fetch leaderboard.', { cause: error });
+  }
+}
+
+interface RecentActivityRow {
+  id: number;
+  uid: string;
+  display_name: string | null;
+  email: string;
+  score: number;
+  turn: number;
+  max_balls: number;
+  created_at: Date | string;
+}
+
+export async function getRecentGlobalActivity(
+  limitCount = 20,
+  excludeUids: string[] = []
+) {
+  try {
+    const cleanExcludes = Array.from(
+      new Set(excludeUids.map((u) => u.trim()).filter((u) => u.length > 0))
+    );
+
+    const recentResult = await db.execute(sql`
+      SELECT
+        gr.id,
+        u.uid,
+        u.display_name,
+        u.email,
+        gr.score,
+        gr.turn,
+        gr.max_balls,
+        gr.created_at
+      FROM game_runs gr
+      INNER JOIN users u ON gr.user_id = u.id
+      WHERE gr.score > 0
+      ORDER BY gr.created_at DESC
+      LIMIT ${Math.max(limitCount * 2, 30)}
+    `);
+
+    const rows = recentResult.rows as unknown as RecentActivityRow[];
+    const excludeSet = new Set(cleanExcludes);
+
+    const entries = rows
+      .filter((row) => !excludeSet.has(row.uid))
+      .slice(0, limitCount)
+      .map((row) => ({
+        id: Number(row.id),
+        playerName: formatPublicPlayerName({
+          displayName: row.display_name,
+          email: row.email,
+          uid: row.uid,
+        }),
+        score: Number(row.score),
+        turn: Number(row.turn),
+        maxBalls: Number(row.max_balls),
+        createdAt:
+          row.created_at instanceof Date
+            ? row.created_at.toISOString()
+            : String(row.created_at),
+      }));
+
+    return entries;
+  } catch (error) {
+    console.error('Database error in getRecentGlobalActivity:', error);
+    throw new Error('Failed to fetch global activity.', { cause: error });
   }
 }
 
